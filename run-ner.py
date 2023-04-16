@@ -620,6 +620,9 @@ def main():
             for prediction, label in zip(predictions, labels)
         ]
 
+        #logger.debug('true_predictions: %s', true_predictions)
+        #logger.debug('true_labels: %s', true_labels)
+
         results = metric.compute(predictions=true_predictions, references=true_labels)
         if data_args.return_entity_level_metrics:
             # Unpack nested dictionaries
