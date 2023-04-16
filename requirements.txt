@@ -1,0 +1,5 @@
+logzero==1.7.0
+numpy==1.24.2
+torch==2.0.0
+transformers==4.28.1
+tqdm==4.65.0
