@@ -20,6 +20,8 @@ from transformers import (
     AutoTokenizer,
 )
 
+import sqliteshelve as shelve
+
 DEBUG_MODE = False
 
 OVERLAP_STRATEGIES = [
@@ -506,19 +508,30 @@ def tag_tokens_with_annotation(
 
 def pre_process_train_data(
     input_dir,
-    output_file,
     tokenizer,
     *,
+    output_json_file = None,
     output_html_dir = None,
     target_categories = None,
     overlap_strategy = DEFAULT_OVERLAP_STRATEGY,
+    tmp_db = None,
 ):
     logger.info('Pre-processing train data')
     logger.info('input_dir: %s', input_dir)
-    logger.info('output_file: %s', output_file)
+    #logger.info('output_file: %s', output_file)
+
+    if tmp_db is None and output_json_file is None:
+        raise ValueError('output_json_file is required if tmp_db is None')
 
     if output_html_dir:
         os.makedirs(output_html_dir, exist_ok=True)
+
+    if tmp_db is None:
+        db = dict()
+    else:
+        db = shelve.open(tmp_db)
+
+    #logger.debug('db: %s', db)
 
     annotation_dir = os.path.join(input_dir, 'annotation')
     html_dir = os.path.join(input_dir, 'html')
@@ -527,29 +540,57 @@ def pre_process_train_data(
     if not os.path.isdir(html_dir):
         raise ValueError(f'directory not found: {html_dir}')
     entries = os.scandir(annotation_dir)
-    categories = []
-    for entry in tqdm(entries, desc='scanning annotation directory'):
-        #logger.debug('entry: %s', entry)
-        #logger.debug('entry.name: %s', entry.name)
-        if entry.name.endswith('_dist.jsonl'):
-            category = entry.name.replace('_dist.jsonl', '')
-            if target_categories and category not in target_categories:
-                # target_categories が与えられた場合は
-                # 対象外のカテゴリは無視する
-                continue
-            categories.append(category)
+    if 'categories' in db:
+        categories = db['categories']
+        logger.info('loaded categories from tmp_db: %s', tmp_db)
+    else:
+        categories = []
+        for entry in tqdm(entries, desc='scanning annotation directory'):
+            #logger.debug('entry: %s', entry)
+            #logger.debug('entry.name: %s', entry.name)
+            if entry.name.endswith('_dist.jsonl'):
+                category = entry.name.replace('_dist.jsonl', '')
+                if target_categories and category not in target_categories:
+                    # target_categories が与えられた場合は
+                    # 対象外のカテゴリは無視する
+                    continue
+                categories.append(category)
+        db['categories'] = categories
+        if tmp_db:
+            db.db.commit()
     #logger.debug('categories: %s', categories)
     if not categories:
         raise ValueError('no categories found')
+    
+    if target_categories:
+        categories = target_categories
+        logger.debug('target_categories: %s', categories)
 
     categories.sort()
-    with open(output_file, 'w', encoding='utf-8') as f_output_json:
+    if 'attribute_names' in db:
+        list_attribute_names = db['attribute_names']
+        set_attribute_names = set(list_attribute_names)
+        logger.info('loaded attribute_names from tmp_db: %s', tmp_db)
+    else:
+        list_attribute_names = []
+    set_attribute_names = set(list_attribute_names)
+    map_category_page_id_to_records = {}
+    if len(list_attribute_names) > 0:
+        for category in tqdm(categories, desc='loading annotation records from db'):
+            map_key = f'map_{category}_page_id_to_records'
+            if map_key in db:
+                map_page_id_to_records = db[map_key]
+                map_category_page_id_to_records[category] = map_page_id_to_records
+    if len(map_category_page_id_to_records) == len(categories):
+        logger.info('all categories are already loaded')
+    else:
         desc = 'loading annotation for each category'
-        set_attribute_names = set()
-        map_category_page_id_to_records = {}
         for i, category in enumerate(tqdm(categories, desc=desc)):
-            if DEBUG_MODE and i > 1:
-                break
+            #if DEBUG_MODE and i > 1:
+            #    break
+            map_key = f'map_{category}_page_id_to_records'
+            if map_key in db:
+                continue
             annotation_file = os.path.join(annotation_dir, f'{category}_dist.jsonl')
             map_page_id_to_records = {}
             with open(annotation_file, 'r', encoding='utf-8') as f_annotation:
@@ -566,14 +607,39 @@ def pre_process_train_data(
                         map_page_id_to_records[page_id] = []
                     map_page_id_to_records[page_id].append(rec)
             map_category_page_id_to_records[category] = map_page_id_to_records
+            db['attribute_names'] = sorted(set_attribute_names)
+            db[map_key] = map_page_id_to_records
+            if tmp_db:
+                db.db.commit()
         list_attribute_names = sorted(set_attribute_names)
-        logger.debug('# list_attribute_names: %s', len(list_attribute_names))
-        processed_records_counter = tqdm(desc='pre-processed records')
-        skipped_records_counter = tqdm(desc='skipped records')
+    logger.debug('# list_attribute_names: %s', len(list_attribute_names))
+
+    map_category_page_id_to_tags = {}
+    processed_records_counter = tqdm(desc='pre-processed records')
+    skipped_records_counter = tqdm(desc='skipped records')
+    if 'total_processed_records' in db:
+        n = db['total_processed_records']
+        processed_records_counter.update(n)
+    if 'total_skipped_records' in db:
+        n = db['total_skipped_records']
+        skipped_records_counter.update(n)
+    if processed_records_counter.n + skipped_records_counter.n > 0:
+        for category in tqdm(categories, desc='loading tags from db'):
+            map_key = f'map_{category}_page_id_to_tags'
+            if map_key in db:
+                map_page_id_to_tags = db[map_key]
+                map_category_page_id_to_tags[category] = map_page_id_to_tags
+    if len(map_category_page_id_to_tags) == len(categories):
+        logger.info('all tags are already loaded')
+    else:
         for category in tqdm(categories, desc='pre-processing categories'):
-            if category not in map_category_page_id_to_records:
+            map_key = f'map_{category}_page_id_to_tags'
+            if map_key in db:
                 continue
+            #if category not in map_category_page_id_to_records:
+            #    continue
             map_page_id_to_records = map_category_page_id_to_records[category]
+            map_page_id_to_tags = {}
             desc = 'pre-processing category pages'
             for page_id, records in tqdm(map_page_id_to_records.items(), desc=desc, leave=False):
                 output = {}
@@ -610,11 +676,29 @@ def pre_process_train_data(
                         logger.error('title: %s', output['title'])
                         logger.error('page_id: %s', page_id)
                         raise e
-                    #if DEBUG_MODE:
-                    #    logger.debug('page_id: %s', page_id)
-                    #    logger.debug('# tokens: %s', len(tokens))
-                    #    sys.exit(1)
-                    json.dump(output, f_output_json, ensure_ascii=False)
+                map_page_id_to_tags[page_id] = output
+            map_category_page_id_to_tags[category] = map_page_id_to_tags
+            db[map_key] = map_page_id_to_tags
+            db['total_processed_records'] = processed_records_counter.n
+            db['total_skipped_records'] = skipped_records_counter.n
+            if tmp_db:
+                db.db.commit()
+
+    if output_json_file:
+        with open(output_json_file, 'w', encoding='utf-8') as f_output_json:
+            desc = 'writing pre-processed data to json file'
+            map_category_page_id_to_records = {}
+            for i, category in enumerate(tqdm(categories, desc=desc)):
+                #if DEBUG_MODE and i > 1:
+                #    break
+                map_page_id_to_tags = map_category_page_id_to_tags[category]
+                desc = f'writing pre-processed data for {category}'
+                for page_id, tags in tqdm(map_page_id_to_tags.items(), desc=desc, leave=False):
+                    f_output_json.write(json.dumps(tags, ensure_ascii=False))
+                    f_output_json.write("\n")
+
+    logger.debug(db)
+    return db
 
 def main():
     global DEBUG_MODE
@@ -624,7 +708,7 @@ def main():
         help='Directory containing training data',
     )
     parser.add_argument(
-        '--output_json_file', type=str, required=True,
+        '--output_json_file', type=str, default=None,
         help='Output file to store pre-processed data (json lines)'
     )
     parser.add_argument(
@@ -647,6 +731,10 @@ def main():
         '--debug', action='store_true',
         help='Enable debug mode'
     )
+    parser.add_argument(
+        '--tmp_db', type=str, default=None,
+        help='Path to temporary database file'
+    )
 
     args = parser.parse_args()
     if args.debug:
@@ -661,11 +749,12 @@ def main():
 
     pre_process_train_data(
         args.train_data_dir,
-        args.output_json_file,
         tokenizer,
+        output_json_file=args.output_json_file,
         output_html_dir=args.output_html_dir,
         target_categories=target_categories,
         overlap_strategy=args.overlap_strategy,
+        tmp_db=args.tmp_db,
     )
 
 if __name__ == "__main__":
