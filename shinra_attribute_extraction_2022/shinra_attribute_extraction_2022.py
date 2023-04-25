@@ -33,32 +33,34 @@ class ShinraAttributeExtraction2022Builder(GeneratorBasedBuilder):
                     "page_id": datasets.Value("string"),
                     "category_name": datasets.Value("string"),
                     "title": datasets.Value("string"),
-                    "attribute": datasets.Value("string"),
                     "ENE": datasets.Value("string"),
                     "context_html": datasets.Value("string"),
                     "context_text": datasets.Value("string"),
-                    "html_offsets": datasets.Sequence({
-                        "start": {
-                            "line_id": datasets.Value("int32"),
-                            "offset": datasets.Value("int32"),
+                    "attributes": datasets.Sequence({
+                        "attribute": datasets.Value("string"),
+                        "html_offset": {
+                            "start": {
+                                "line_id": datasets.Value("int32"),
+                                "offset": datasets.Value("int32"),
+                            },
+                            "end": {
+                                "line_id": datasets.Value("int32"),
+                                "offset": datasets.Value("int32"),
+                            },
+                            "text": datasets.Value("string"),
                         },
-                        "end": {
-                            "line_id": datasets.Value("int32"),
-                            "offset": datasets.Value("int32"),
+                        "text_offset": {
+                            "start": {
+                                "line_id": datasets.Value("int32"),
+                                "offset": datasets.Value("int32"),
+                            },
+                            "end": {
+                                "line_id": datasets.Value("int32"),
+                                "offset": datasets.Value("int32"),
+                            },
+                            "text": datasets.Value("string"),
                         },
-                        "text": datasets.Value("string"),
                     }),
-                    "text_offsets": datasets.Sequence({
-                        "start": {
-                            "line_id": datasets.Value("int32"),
-                            "offset": datasets.Value("int32"),
-                        },
-                        "end": {
-                            "line_id": datasets.Value("int32"),
-                            "offset": datasets.Value("int32"),
-                        },
-                        "text": datasets.Value("string"),
-                    })
                 }
             )
         )
@@ -119,27 +121,27 @@ class ShinraAttributeExtraction2022Builder(GeneratorBasedBuilder):
                             map_page_id_to_records[page_id].append(data)
                     for page_id, records in map_page_id_to_records.items():
                         first = records[0]
-                        html_offsets = []
-                        text_offsets = []
                         html_path = os.path.join(html_dir, category, page_id + '.html')
                         text_path = os.path.join(plain_dir, category, page_id + '.txt')
+                        attributes = []
                         with open(html_path, 'r', encoding='utf-8') as f:
                             html = f.read()
                         with open(text_path, 'r', encoding='utf-8') as f:
                             text = f.read()
                         for record in records:
-                            html_offsets.append(record['html_offset'])
-                            text_offsets.append(record['text_offset'])
+                            attributes.append({
+                                'attribute': record['attribute'],
+                                'html_offset': record['html_offset'],
+                                'text_offset': record['text_offset'],
+                            })
                         yield page_id, {
                             'page_id': page_id,
                             'category_name': category,
                             'title': first['title'],
-                            'attribute': first['attribute'],
                             'ENE': first['ENE'],
                             'context_html': html,
                             'context_text': text,
-                            'html_offsets': html_offsets,
-                            'text_offsets': text_offsets,
+                            'attributes': attributes,
                         }
                     #break
 
