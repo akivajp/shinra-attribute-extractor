@@ -6,10 +6,6 @@ import json
 import math
 import os
 import sys
-#import random
-#from pathlib import Path
-
-import sqliteshelve as shelve
 
 import datasets
 from datasets import (
@@ -31,22 +27,14 @@ from tqdm.auto import tqdm
 
 import transformers
 from transformers import (
-    #CONFIG_MAPPING,
-    #MODEL_MAPPING,
     AutoConfig,
     AutoModel,
-    AutoModelForTokenClassification,
     AutoTokenizer,
-    DataCollatorForTokenClassification,
-    PretrainedConfig,
     SchedulerType,
-    default_data_collator,
     get_scheduler,
 )
 
 from logzero import logger
-
-#from converter import load_train_dataset
 
 from tokenization import (
     tokenize_with_offsets,
@@ -57,11 +45,6 @@ from tagging import (
 from html_cleaning import (
     clean_up_html,
 )
-
-#MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
-#MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
-#logger.debug('MODEL_CONFIG_CLASSES: %s', MODEL_CONFIG_CLASSES)
-#logger.debug('MODEL_TYPES: %s', MODEL_TYPES)
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -91,45 +74,8 @@ def parse_args():
     #    help="The name of the dataset to use (via the datasets library).",
     #)
     #parser.add_argument(
-    #    "--dataset_config_name",
-    #    type=str,
-    #    default=None,
-    #    help="The configuration name of the dataset to use (via the datasets library).",
-    #)
-    #parser.add_argument(
-    #    "--train_file", type=str, default=None,
-    #    #help="A csv or a json file containing the training data.",
-    #    help="A json lines (.jsonl) or sqlite-shelve (.db) file containing the training data.",
-    #)
-    #parser.add_argument(
-    #    "--train_html_dir", type=str, default=None,
-    #    help="A directory path containing the training html files.",
-    #)
-    #parser.add_argument(
     #    "--validation_file", type=str, default=None,
     #    help="A csv or a json file containing the validation data.",
-    #)
-    #parser.add_argument(
-    #    "--text_column_name",
-    #    type=str,
-    #    default=None,
-    #    help="The column name of text to input in the file (a csv or JSON file).",
-    #)
-    #parser.add_argument(
-    #    "--label_column_name",
-    #    type=str,
-    #    default=None,
-    #    help="The column name of label to input in the file (a csv or JSON file).",
-    #)
-    #parser.add_argument(
-    #    "--max_length",
-    #    type=int,
-    #    default=128,
-    #    help=(
-    #        "The maximum total input sequence length after tokenization. "
-    #        "Sequences longer than this will be truncated, "
-    #        "sequences shorter will be padded if `--pad_to_max_length` is passed."
-    #    )
     #)
     parser.add_argument(
         "--window_size",
@@ -233,30 +179,11 @@ def parse_args():
         default=None,
         help="A seed for reproducible training.",
     )
-    #parser.add_argument(
-    #    "--model_type",
-    #    type=str,
-    #    default=None,
-    #    help="Model type to use if training from scratch.",
-    #    choices=MODEL_TYPES,
-    #)
-    #parser.add_argument(
-    #    "--label_all_tokens",
-    #    action="store_true",
-    #    help="Setting labels of all special tokens to -100 and thus PyTorch will ignore them.",
-    #)
     parser.add_argument(
         "--return_entity_level_metrics",
         action="store_true",
         help="Indication whether entity level metrics are to be returner.",
     )
-    #parser.add_argument(
-    #    "--task_name",
-    #    type=str,
-    #    default="ner",
-    #    choices=["ner", "pos", "chunk"],
-    #    help="The name of the tasks.",
-    #)
     parser.add_argument(
         "--debug",
         action="store_true",
@@ -266,7 +193,8 @@ def parse_args():
         "--checkpointing_steps",
         type=int,
         #default=None,
-        default=500,
+        #default=500,
+        default=100,
         help=
             "The various states should be saved at the end of every n steps."
             
@@ -282,17 +210,6 @@ def parse_args():
         action="store_true",
         help="Whether or enable experiment trackers for logging.",
     )
-    #parser.add_argument(
-    #    "--report_to",
-    #    type=str,
-    #    default="all",
-    #    help=(
-    #        "The integration to report the results and logs to. "
-    #        'Supported platforms are `"tensorboard"`, `"wandb"`, `"comet_ml"`, and `"clearml"`. '
-    #        'Use `"all"` (default) to report to all integrations. '
-    #        "Only applicable when `--with_tracking` is passed."
-    #    ),
-    #)
     parser.add_argument(
         "--ignore_mismatched_sizes",
         action="store_true",
@@ -322,33 +239,13 @@ def parse_args():
 
     args = parser.parse_args()
 
-    # Sanity checks
-    #if args.task_name is None and args.train_file is None and args.validation_file is None:
-    #if args.train_file is None and args.validation_file is None:
-    #    raise ValueError("Need either a task name or a training/validation file.")
-    #if args.train_file is not None:
-    #    extension = args.train_file.split(".")[-1]
-    #    assert extension in ["db", "jsonl"], "`train_file` should be a db or jsonl file."
-    #if args.validation_file is not None:
-    #    extension = args.validation_file.split(".")[-1]
-    #    #assert extension in ["csv", "json"], "`validation_file` should be a csv or a json file."
-    #    assert extension in ["jsonl"], "`validation_file` should be a json file."
-
     return args
 
-#class TokenMultiClassificationModel(torch.nn.Module):
 class TokenMultiClassificationModel(transformers.PreTrainedModel):
-    #def __init__(self, config, num_attribute_names, **hparams):
-    #def __init__(self, config, num_attribute_names):
     def __init__(self, config, pretrained_model_name_or_path, num_attribute_names):
-    #def __init__(self, config, num_attribute_names):
-    #def __init__(self, config):
         logger.debug('__init__')
         super().__init__(config)
-        #self.base_model = torch.nn.Linear(50, 50)
-        #self.base_model2 = torch.nn.Linear(50, 50)
         self.config = config
-        #self.num_attribute_names = config.num_attribute_names
         self.num_attribute_names = num_attribute_names
         self.num_labels = config.num_labels
         classifier_dropout = (
@@ -356,25 +253,11 @@ class TokenMultiClassificationModel(transformers.PreTrainedModel):
             else config.hidden_dropout_prob
         )
 
-        #if hparams.get('num_labels') is not None:
-        #    self.num_labels = hparams['num_labels']
-        #self.base_classifier = AutoModelForTokenClassification.from_pretrained(
-        #    config = config,
-        #    #num_labels = self.num_labels * self.num_attribute_names,
-        #    **hparams
-        #)
         self.encoder = AutoModel.from_pretrained(
-        #self.base_model = AutoModel.from_pretrained(
-        #self.base_model = AutoModel.from_config(
-        #self.base_model = transformers.BertModel(
-        #self.base_model = transformers.AlbertModel(
             pretrained_model_name_or_path = pretrained_model_name_or_path,
             config = config,
             add_pooling_layer=False,
         )
-        #logger.debug('base_model: %s', base_model)
-        #self.base_model = torch.nn.Linear(50, 50)
-        #logger.debug('self.base_model: %s', self.base_model)
         self.dropout = torch.nn.Dropout(classifier_dropout)
         self.classifier = torch.nn.Linear(
             config.hidden_size,
@@ -392,20 +275,9 @@ class TokenMultiClassificationModel(transformers.PreTrainedModel):
         tag_ids = None,
         **kwargs,
     ):
-        #logger.debug('input_ids: %s', input_ids)
-        #logger.debug('tag_ids: %s', tag_ids)
-        #logger.debug('kwargs: %s', kwargs)
-        #if attention_mask is not None:
-        #    logger.debug('attention_mask.shape: %s', attention_mask.shape)
-
         batch_size = input_ids.shape[0]
         seq_length = input_ids.shape[1]
 
-        #logger.debug('self.encoder: %s', self.encoder)
-        #logger.debug('self.base_mode: %s', self.base_model)
-        #logger.debug('self: %s', self)
-        #return
-        #outputs = self.base_model(
         outputs = self.encoder(
             input_ids,
             attention_mask = attention_mask,
@@ -413,39 +285,19 @@ class TokenMultiClassificationModel(transformers.PreTrainedModel):
             **kwargs
         )
 
-        #logger.debug('outputs: %s', outputs)
-        #logger.debug('outputs last hidden: %s', outputs.last_hidden_state)
-        #logger.debug('outputs shape: %s', outputs.shape)
-
-        #last_hidden_state = outputs.last_hidden_state
-        #logger.debug('last_hidden_state: %s', last_hidden_state)
-        #logger.debug('last_hidden_state.shape: %s', last_hidden_state.shape)
-        #logger.debug('last_hidden_state[0].shape: %s', last_hidden_state[0].shape)
-        ##sequence_outputs = outputs[0]
-        #logger.debug('outputs[0]: %s', outputs[0])
-        #logger.debug('outputs[0].shape: %s', outputs[0].shape)
-
         sequence_output = outputs[0] # [B, L, H]
-        #logger.debug('sequence_output: %s', sequence_output)
-        #logger.debug('sequence_output.shape: %s', sequence_output.shape)
 
         sequence_output = self.dropout(sequence_output)
         logits = self.classifier(sequence_output) # [B, L, C*A]
         logits = logits.reshape(
             batch_size, seq_length, self.num_attribute_names, self.num_labels
         ) # [B, L, A, C]
-        #logger.debug('logits: %s', logits)
-        #logger.debug('logits.shape: %s', logits.shape)
 
         loss = None
         if tag_ids is not None:
             loss_fct = torch.nn.CrossEntropyLoss()
-            #logger.debug('logits view shape: %s', logits.view(-1, self.num_labels).shape)
-            #logger.debug('tag_ids view shape: %s', tag_ids.view(-1).shape)
             loss = loss_fct(logits.view(-1, self.num_labels), tag_ids.view(-1))
-            #logger.debug('loss: %s', loss)
 
-        #return logits
         return transformers.modeling_outputs.MultipleChoiceModelOutput(
             loss=loss,
             logits=logits,
@@ -467,15 +319,10 @@ def main():
     )
 
     # Make one log on every process with the configuration for debugging.
-    #import logging
-    #logging.basicConfig(
-    #    format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
-    #    datefmt="%m/%d/%Y %H:%M:%S",
-    #    level=logging.INFO,
-    #)
-    #logger.info(accelerator.state, main_process_only=False)
-    logger.info('accelerator.state: %s', accelerator.state)
+    if accelerator.is_main_process:
+        logger.info('accelerator.state: %s', accelerator.state)
 
+    # ロギング設定
     if accelerator.is_local_main_process:
         datasets.utils.logging.set_verbosity_warning()
         transformers.utils.logging.set_verbosity_info()
@@ -493,36 +340,6 @@ def main():
             os.makedirs(args.output_dir, exist_ok=True)
     accelerator.wait_for_everyone()
 
-    # Get the datasets: you can either provider your own CSV/JSON/TXT training and evaluation files
-    # (see below) or just provide the name of one of the public datasets available on the hub at
-    # https://huggingface.co/datasets/
-    # (the dataset will be downloaded automatically from the datasets Hub).
-    #
-    # For CSV/JSON files, this script will use the column called 'tokens' or
-    # the first column if no column called 'tokens' is found.
-    # You can easily tweak this behavior (see below).
-    #
-    # In distributed training, the load_dataset function guarantee
-    # that only one local process can concurrently download the dataset.
-
-    #def gen_dataset(file_path):
-    #    extension = file_path.split(".")[-1]
-    #    if extension == 'db':
-    #        pass
-    #    elif extension == 'jsonl':
-    #        pass
-    #    else:
-    #        raise ValueError(f'"{file_path}" with not supported extension: "{extension}"')
-
-    #data_files = {}
-    #if args.train_file is not None:
-    #    data_files["train"] = args.train_file
-    #if args.validation_file is not None:
-    #    data_files["validation"] = args.validation_file
-    #extension = args.train_file.split(".")[-1]
-    #raw_datasets = load_dataset(extension, data_files=data_files)
-    #raw_datasets = load_dataset('json', data_files=data_files)
-
     raw_dataset = load_dataset('./shinra_attribute_extraction_2022')
     logger.debug('raw_dataset: %s', raw_dataset)
 
@@ -532,6 +349,7 @@ def main():
     dataset = dataset.flatten()
     dataset = dataset.remove_columns(['context_text', 'attributes.text_offset'])
 
+    # --target_categories が与えられた場合は、そのカテゴリのみで絞り込む
     target_categories = None
     if args.target_categories is not None:
         target_categories = args.target_categories.split(',')
@@ -542,11 +360,10 @@ def main():
         )
     logger.debug('dataset: %s', dataset)
 
+    # 全属性名のリストと、
+    # ENE に対応する属性名のリストの辞書を作成
     set_attribute_names = set()
     map_ene_to_attribute_name_set = {}
-    #for attribute_names_in_annotation in dataset['train']['attributes.attribute']:
-    #    for attribute_name in attribute_names_in_annotation:
-    #        set_attribute_names.add(attribute_name)
     for example in dataset['train']:
         ene = example['ENE']
         for attribute_name in example['attributes.attribute']:
@@ -558,7 +375,9 @@ def main():
     map_attribute_name_to_id = {name: i for i, name in enumerate(attribute_names)}
     num_attribute_names = len(attribute_names)
 
-
+    # HTML をクリーニング
+    # (属性値抽出の対象とならないであろう箇所を除去)
+    # (HTMLタグは一般的なサブワード分割と相性が悪く)
     def clean_context_html(example):
         cleaned_html = clean_up_html(example['context_html'])
         return {'context_html': cleaned_html}
@@ -569,15 +388,10 @@ def main():
         args.model_name_or_path,
     )
 
-    #dataset['train'] = dataset['train'].select(range(5))
+    # トークン化と IOB2 タグの付与
     def tokenize_and_tag(example):
-        #logger.debug('example: %s', example)
-        #logger.debug('example["offsets"]: %s', example["offsets"])
         tokens_with_offsets = tokenize_with_offsets(tokenizer, example['context_html'])
         tokens = [token.text for token in tokens_with_offsets]
-        #logger.debug('# tokens: %s', len(tokens))
-        #tags = tag_tokens_with_annotation_list(tokens_with_offsets, example['attributes'])
-        #tags = tag_tokens_with_annotation_list(tokens_with_offsets, [
         tags, num_valids, num_skipped = tag_tokens_with_annotation_list(tokens_with_offsets, [
             {'attribute': attribute, 'html_offset': html_offset}
             for attribute, html_offset in zip(
@@ -598,6 +412,9 @@ def main():
             test_size=args.split_eval_ratio, seed=args.seed
         )
 
+    # 通常、512トークンを超える系列の処理はそのままできないため、
+    # スライドウィンドウを用いて分割する
+    # (データセットのチャンク分割はバッチ処理でのみ可能)
     def split_into_windows(examples):
         windows = {
             field: []
@@ -641,55 +458,22 @@ def main():
     config = AutoConfig.from_pretrained(
         args.model_name_or_path,
         num_labels=num_labels,
-        #num_labels=num_labels * num_attribute_names,
-        #num_attribute_names=num_attribute_names,
-        #finetuning_task=args.task_name
     )
 
-    #model = AutoModelForTokenClassification.from_pretrained(
-    #    args.model_name_or_path,
-    #    from_tf=bool(".ckpt" in args.model_name_or_path),
-    #    config=config,
-    #    ignore_mismatched_sizes=args.ignore_mismatched_sizes,
-    #)
     model = TokenMultiClassificationModel(
-    #model = TokenMultiClassificationModel.from_pretrained(
         pretrained_model_name_or_path=args.model_name_or_path,
         config=config,
         num_attribute_names = num_attribute_names,
-        #num_labels=num_labels,
-        #pretrained_model_name_or_path=args.model_name_or_path,
-        #ignore_mismatched_sizes=args.ignore_mismatched_sizes,
     )
     logger.debug('model: %s', model)
 
-    # # We resize the embeddings only when necessary to avoid index errors.
-    # # If you are creating a model from scratch on a small vocab and want
-    # # a small vocab and want a smaller embedding size, remove this test.
-    # embedding_size = model.get_input_embeddings().weight.shape[0]
-    # #if len(tokenizer) > embedding_size:
-    # #    embedding_size = model.get_input_embeddings().weight.shape[0]
-    # if len(tokenizer) > embedding_size:
-    #     model.resize_token_embeddings(len(tokenizer))
-    # logger.debug('embedding_size: %s', embedding_size)
-
-    #label_list = ['O', 'B', 'I']
-
-    #model.config.label2id = label_to_id
-    #model.config.label2id = map_tag_to_id
-    #model.config.label2id = {l: i for i, l in enumerate(label_list)}
-    #model.config.id2label = label_list
     model.config.label2id = map_tag_to_id
     model.config.id2label = tag_list
 
     logger.debug('new model.config: %s', model.config)
 
-    # Preprocessing the datasets.
-    # First we tokenizer all the texts.
-    padding = "max_length" if args.pad_to_max_length else False
-    logger.debug('padding: %s', padding)
-
-    logger.debug('attribute_names: %s', attribute_names)
+    #logger.debug('attribute_names: %s', attribute_names)
+    # トークン ID とタグ ID の付与
     def prepare_ids(example):
         token_ids = tokenizer.encode(example['tokens'])
         tag_ids = [
@@ -726,24 +510,14 @@ def main():
     train_dataset = dataset['train']
     eval_dataset = dataset['test']
 
+    # ミニバッチ生成のための追加処理
     def my_collator(examples):
-        #logger.debug('# examples: %s', len(examples))
-        #logger.debug('examples: %s', examples)
-        #logger.debug('examples["input_ids"]: %s', examples["input_ids"])
         input_ids = [
-            #torch.tensor(ids, dtype=torch.int32) for ids in examples['input_ids']
-            #torch.tensor(example['input_ids'], dtype=torch.int32)
             torch.tensor(example['input_ids'], dtype=torch.int64)
             for example in examples
         ]
         # cuda の nll_loss のターゲットは long にしか対応していない模様
         tag_ids = [
-            #torch.tensor(ids, dtype=torch.int8) for ids in examples['labels']
-            #torch.tensor(example['labels'], dtype=torch.int8)
-            #torch.tensor(example['labels'], dtype=torch.int8).transpose(1, 0)
-            #'tag_ids': pad_sequence(tag_ids, batch_first=True),
-            #torch.tensor(example['tag_ids'], dtype=torch.int8).transpose(1, 0)
-            #torch.tensor(example['tag_ids'], dtype=torch.int32).transpose(1, 0)
             torch.tensor(example['tag_ids'], dtype=torch.int64).transpose(1, 0)
             for example in examples
         ]
@@ -754,14 +528,8 @@ def main():
         token_type_ids = [
             torch.zeros(len(ids), dtype=torch.int32) for ids in input_ids
         ]
-        #logger.debug('input_ids shapes: %s', [input_id.shape for input_id in input_ids])
-        #logger.debug('label shapes: %s', [label.shape for label in labels])
-        #logger.debug('mask: %s', mask)
-        #logger.debug('mask.shape: %s', [m.shape for m in mask])
         return {
             'input_ids': pad_sequence(input_ids, batch_first=True),
-            #'labels': pad_sequence(labels, batch_first=True),
-            #'tag_ids': pad_sequence(tag_ids, batch_first=True),
             'tag_ids': pad_sequence(tag_ids, batch_first=True, padding_value=-100),
             'attention_mask': pad_sequence(mask, batch_first=True),
             'token_type_ids': pad_sequence(token_type_ids, batch_first=True),
@@ -867,11 +635,6 @@ def main():
         y_pred = y_pred.transpose(0, 2, 1).reshape(batch_size*num_attribute_names, seq_len)
         y_true = y_true.transpose(0, 2, 1).reshape(batch_size*num_attribute_names, seq_len)
 
-        #logger.debug('y_pred: %s', y_pred)
-        #logger.debug('y_true: %s', y_true)
-        #logger.debug('y_pred shape: %s', y_pred.shape)
-        #logger.debug('y_true shape: %s', y_true.shape)
-
         # Remove ignored index (special tokens)
         true_predictions = [
             #[label_list[p] for (p, l) in zip(pred, gold_label) if l != -100]
@@ -923,6 +686,14 @@ def main():
     starting_epoch = 0
     # Potentially load in the weights and states from a previous save
     resume_path = None
+
+    status_path = os.path.join(args.output_dir, "status.json")
+    status = {}
+    if os.path.isfile(status_path):
+        with open(status_path, "r", encoding='utf-8') as f:
+            status = json.load(f)
+            logger.debug('Loaded status: %s', status)
+ 
     if args.resume_from_checkpoint:
     #if args.resume_from_checkpoint is not None or args.resume_from_checkpoint != "":
     #if args.resume_from_checkpoint is not None and args.resume_from_checkpoint != "":
@@ -944,26 +715,41 @@ def main():
             #resume_path = os.path.join(args.output_dir, dirs[-1])
             #logger.debug('path: %s', path)
             #resume_path = get_last_checkpoint(args.output_dir)
-            logger.debug('resume_path: %s', resume_path)
+            #logger.debug('resume_path: %s', resume_path)
             accelerator.load_state(resume_path)
     logger.debug('resume_path: %s', resume_path)
 
     starting_epoch = 0
     resume_step = -1
+    eval_metric = None
+
     # Extract `epoch_{i}` or `step_{i}`
     if resume_path:
         training_difference = os.path.splitext(resume_path)[0]
         logger.debug('training_difference: %s', training_difference)
 
-        if "epoch" in training_difference:
-            starting_epoch = int(training_difference.split("_")[1])
-            #resume_step = None
-        else:
-            resume_step = int(training_difference.split("_")[1])
+        if "epoch_" in training_difference and "_step_" in training_difference:
+            resume_step = int(training_difference.split("_")[-1])
             starting_epoch = resume_step // len(train_dataloader)
             resume_step -= starting_epoch * len(train_dataloader)
+        else:
+            raise ValueError(f'Failed to parse training_difference: {training_difference}')
     logger.debug('starting_epoch: %d', starting_epoch)
     logger.debug('resume_step: %d', resume_step)
+
+    def save_best_status(eval_metric):
+        status['last_step'] = completed_steps
+        for key in ['precision', 'recall', 'f1']:
+            last_key = f'eval_{key}_last'
+            best_key = f'eval_{key}_best'
+            best_step_key = f'eval_{key}_best_step'
+            status[last_key] = eval_metric[key]
+            if best_key not in status or status[last_key] > status[best_key]:
+                status[best_key] = status[last_key]
+                status[best_step_key] = status['last_step']
+                logger.debug('New best %s: %f', key, status[best_key])
+        with open(status_path, "w", encoding='utf-8') as f:
+            json.dump(status, f, indent=2, sort_keys=True, ensure_ascii=False)
 
     def do_eval():
         model.eval()
@@ -971,20 +757,8 @@ def main():
         for step, batch in enumerate(eval_dataloader):
             with torch.no_grad():
                 outputs = model(**batch)
-            #logger.debug('logits shape: %s', outputs.logits.shape)
             predictions = outputs.logits.argmax(dim=-1)
-            #logger.debug('predictions shape: %s', predictions.shape)
-            #labels = batch["labels"]
             tag_ids = batch["tag_ids"]
-            #if not args.pad_to_max_length:
-            #    # necessary to pad predictions and labels for being gathered
-            #    predictions = accelerator.pad_across_processes(
-            #        predictions, dim=1, pad_index=-100,
-            #    )
-            #    #labels = accelerator.pad_across_processes(labels, dim=1, pad_index=-100)
-            #    labels = accelerator.pad_across_processes(tag_ids, dim=1, pad_index=-100)
-            #predictions_gathered, labels_gathered = accelerator.gather([predictions, labels])
-            #predictions_gathered, labels_gathered = accelerator.gather([predictions, tag_ids])
             predictions_gathered, tags_gathered = accelerator.gather([predictions, tag_ids])
             # If we are in a multi-process environment,
             # the last batch has duplicates
@@ -1010,34 +784,22 @@ def main():
         #accelerator.print(f"epoch {epoch}:", eval_metric)
         if accelerator.is_main_process:
             logger.info(f'epoch {epoch} eval_metric: {eval_metric}')
+        save_best_status(eval_metric)
         return eval_metric
 
 
     #for epoch in range(starting_epoch, args.num_train_epochs):
     for epoch in range(0, args.num_train_epochs):
-
+        # 学習済みのステップはスキップ
         if starting_epoch > epoch:
             completed_steps += len(train_dataloader)
             progress_bar.update(len(train_dataloader))
             continue
 
-        model.train()
-        #if args.with_tracking:
         total_loss = 0
+        zfilled_epoch = str(epoch).zfill(len(str(args.num_train_epochs - 1)))
         for step, batch in enumerate(train_dataloader):
-            #logger.debug('step: %d', step)
-            #logger.debug('batch: %s', batch)
-            #logger.debug('batch input_ids shape: %s', batch['input_ids'].shape)
-            #logger.debug('batch attention_mask shape: %s', batch['attention_mask'].shape)
-            #logger.debug('batch labels shape: %s', batch['labels'].shape)
-            # We need to skip steps until we reach the resumed step
-            #if args.resume_from_checkpoint and epoch == starting_epoch:
-            #    if resume_step is not None and step <= resume_step:
-            #        completed_steps += 1
-            #        continue
             if starting_epoch == epoch:
-                #if resume_step is not None and step <= resume_step:
-                #if step <= resume_step:
                 if step <= resume_step:
                     completed_steps += 1
                     progress_bar.update(1)
@@ -1058,7 +820,8 @@ def main():
 
             if isinstance(checkpointing_steps, int):
                 if completed_steps % checkpointing_steps == 0:
-                    output_dir = f"step_{completed_steps}"
+                    #output_dir = f"step_{completed_steps}"
+                    output_dir = f"epoch_{zfilled_epoch}_step_{completed_steps}"
                     if args.output_dir is not None:
                         output_dir = os.path.join(args.output_dir, output_dir)
                     accelerator.save_state(output_dir)
@@ -1089,44 +852,39 @@ def main():
             train_log['seqeval'] = eval_metric
             accelerator.log(
                 train_log,
-                #{
-                #    "seqeval": eval_metric,
-                #    "train_loss": total_loss.item() / len(train_dataloader),
-                #    "epoch": epoch,
-                #    "step": completed_steps,
-                #},
                 step=completed_steps,
             )
 
-        #if args.checkpointing_steps == "epoch":
-        if True:
-            output_dir = f"epoch_{epoch}"
-            if args.output_dir is not None:
-                output_dir = os.path.join(args.output_dir, output_dir)
-            accelerator.save_state(output_dir)
+        # 各エポック毎のモデルは毎回保存
+        #output_dir = f"epoch_{epoch}"
+        output_dir = f"epoch_{zfilled_epoch}_step_{completed_steps}"
+        if args.output_dir is not None:
+            output_dir = os.path.join(args.output_dir, output_dir)
+        accelerator.save_state(output_dir)
 
     if args.with_tracking:
         accelerator.end_training()
 
     if args.output_dir is not None:
-        accelerator.wait_for_everyone()
-        unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.save_pretrained(
-        #accelerator.save(
-            #model,
-            args.output_dir,
-            is_main_process=accelerator.is_main_process,
-            save_function=accelerator.save,
-        )
-        if accelerator.is_main_process:
-            tokenizer.save_pretrained(args.output_dir)
+        if eval_metric is not None:
+            accelerator.wait_for_everyone()
+            unwrapped_model = accelerator.unwrap_model(model)
+            unwrapped_model.save_pretrained(
+                args.output_dir,
+                is_main_process=accelerator.is_main_process,
+                save_function=accelerator.save,
+            )
+            if accelerator.is_main_process:
+                tokenizer.save_pretrained(args.output_dir)
 
-            all_results = {f"eval_{k}": v for k, v in eval_metric.items()}
-            if args.with_tracking:
-                all_results.update({"train_loss": total_loss.item() / len(train_dataloader)})
-            all_results_path = os.path.join(args.output_dir, "all_results.json")
-            with open(all_results_path, "w", encoding="utf-8") as f:
-                json.dump(all_results, f)
+                all_results = {f"eval_{k}": v for k, v in eval_metric.items()}
+                if args.with_tracking:
+                    all_results.update({"train_loss": total_loss.item() / len(train_dataloader)})
+                all_results_path = os.path.join(args.output_dir, "all_results.json")
+                with open(all_results_path, "w", encoding="utf-8") as f:
+                    json.dump(all_results, f)
+                with open(status_path, "w", encoding="utf-8") as f:
+                    json.dump(status, f, ensure_ascii=False, sort_keys=True, indent=2)
 
 if __name__ == '__main__':
     main()
