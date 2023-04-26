@@ -34,6 +34,7 @@ from transformers import (
     get_scheduler,
 )
 
+import logzero
 from logzero import logger
 
 from tokenization import (
@@ -338,6 +339,8 @@ def main():
     if accelerator.is_main_process:
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
+            logfile = os.path.join(args.output_dir, 'training.log')
+            logzero.logfile(logfile)
     accelerator.wait_for_everyone()
 
     raw_dataset = load_dataset('./shinra_attribute_extraction_2022')
@@ -381,7 +384,7 @@ def main():
     def clean_context_html(example):
         cleaned_html = clean_up_html(example['context_html'])
         return {'context_html': cleaned_html}
-    dataset = dataset.map(clean_context_html)
+    dataset = dataset.map(clean_context_html, desc='Cleaning HTML files')
     logger.debug('dataset: %s', dataset)
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -482,7 +485,7 @@ def main():
         ]
         #tag_ids = [map_tag_to_id[tag] for tag in example['tags']]
         for attribute_name, tags in example['tags'].items():
-            attribute_id = attribute_names.index(attribute_name)
+            attribute_id = map_attribute_name_to_id[attribute_name]
             ene = example['ENE']
             attirbute_name_set = map_ene_to_attribute_name_set[ene]
             if ene not in attirbute_name_set:
