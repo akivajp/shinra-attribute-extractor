@@ -178,7 +178,8 @@ def parse_args():
     parser.add_argument(
         "--seed",
         type=int,
-        default=None,
+        #default=None,
+        default=42,
         help="A seed for reproducible training.",
     )
     parser.add_argument(
@@ -253,6 +254,9 @@ def parse_args():
     return args
 
 class TokenMultiClassificationModel(transformers.PreTrainedModel):
+    '''
+    A multi-label classification model based on a pretrained transformer model.
+    '''
     def __init__(self, config, pretrained_model_name_or_path, num_attribute_names):
         logger.debug('__init__')
         super().__init__(config)
@@ -376,14 +380,26 @@ def main():
     # 全属性名のリストと、
     # ENE に対応する属性名のリストの辞書を作成
     set_attribute_names = set()
-    map_ene_to_attribute_name_set = {}
+    # NOTE: 超重要
+    #   Dict[str,Set] で事足りることだけど、
+    #   何故か Dataset.map()の適用関数内でsetオブジェクトに依存すると
+    #   関数が同一視できなくなるらしくキャッシュロードできなくなるので
+    #   計算量的に Dict[str,Dict] で代用する
+    #   ついでに属性の出現回数でもカウントしておく
+    #map_ene_to_attribute_name_set: dict[str,set] = {}
+    map_ene_to_attribute_name_counter: dict[str,dict[str,int]] = {}
     for example in dataset['train']:
         ene = example['ENE']
         for attribute_name in example['attributes.attribute']:
             set_attribute_names.add(attribute_name)
-            if ene not in map_ene_to_attribute_name_set:
-                map_ene_to_attribute_name_set[ene] = set()
-            map_ene_to_attribute_name_set[ene].add(attribute_name)
+            # NOTE: setの代わりにdictを使う必要あり(前述の理由)
+            # if ene not in map_ene_to_attribute_name_set:
+            #     map_ene_to_attribute_name_set[ene] = set()
+            # map_ene_to_attribute_name_set[ene].add(attribute_name)
+            if ene not in map_ene_to_attribute_name_counter:
+                map_ene_to_attribute_name_counter[ene] = {}
+            count = map_ene_to_attribute_name_counter[ene].get(attribute_name, 0)
+            map_ene_to_attribute_name_counter[ene][attribute_name] = count + 1
     attribute_names = sorted(set_attribute_names)
     map_attribute_name_to_id = {name: i for i, name in enumerate(attribute_names)}
     num_attribute_names = len(attribute_names)
@@ -418,12 +434,13 @@ def main():
             seed=args.seed
         )
         logger.debug('dataset: %s', dataset)
+    #logger.debug('dataset test page_id: %s', dataset['test']['page_id'])
 
     # トークン化と IOB2 タグの付与
     def tokenize_and_tag(example):
         tokens_with_offsets = tokenize_with_offsets(tokenizer, example['context_html'])
         tokens = [token.text for token in tokens_with_offsets]
-        tags, num_valids, num_skipped = tag_tokens_with_annotation_list(
+        tags, num_tagged, num_skipped = tag_tokens_with_annotation_list(
             tokens_with_offsets,
             [
                 {'attribute': attribute, 'html_offset': html_offset}
@@ -432,108 +449,28 @@ def main():
                 )
             ]
         )
-
         extended_tags = [
-            #[' '] * len(tokens)
             ' ' * len(tokens)
             for _ in range(len(attribute_names))
         ]
         ene = example['ENE']
-        attribute_name_set = map_ene_to_attribute_name_set[ene]
-        for attribute_name in attribute_name_set:
+        attribute_name_counter = map_ene_to_attribute_name_counter[ene]
+        for attribute_name in attribute_name_counter:
             attribute_id = map_attribute_name_to_id[attribute_name]
             if attribute_name in tags:
                 extended_tags[attribute_id] = str.join('', tags[attribute_name])
-                #extended_tags[attribute_id] = tags[attribute_name]
             else:
                 extended_tags[attribute_id] = 'O' * len(tokens)
-                #extended_tags[attribute_id] = ['O'] * len(tokens)
-        #examples['tokens'].append(tokens)
-        #examples['tags'].append(extended_tags)
-
         #logger.debug('tags: %s', tags)
         return {
             'tokens': tokens,
-            #'tags': tags,
             'tags': extended_tags,
         }
-    #def tokenize_and_tag(example):
-    def batch_tokenize_and_tag(examples):
-        #logger.debug('# examples: %d', len(examples))
-        #logger.debug('examples type: %s', type(examples))
-        #logger.debug('page_ids type: %s', type(examples['page_id']))
-        #list_tokens = []
-        examples['tokens'] = []
-        examples['tags'] = []
-        for context_html, attributes, html_offsets, ene in zip(
-            examples['context_html'],
-            examples['attributes.attribute'],
-            examples['attributes.html_offset'],
-            examples['ENE'],
-        ):
-        #for index, page_id in enumerate(examples['page_id']):
-            #context_html = examples['context_html'][index]
-            #attributes = examples['attributes.attribute'][index]
-            #html_offsets = examples['attributes.html_offset'][index]
-            tokens_with_offsets = tokenize_with_offsets(tokenizer, context_html)
-            tokens = [token.text for token in tokens_with_offsets]
-            #tags, num_valids, num_skipped = tag_tokens_with_annotation_list(tokens_with_offsets, [
-            #    {'attribute': attribute, 'html_offset': html_offset}
-            #    for attribute, html_offset in zip(
-            #        example['attributes.attribute'], example['attributes.html_offset']
-            #    )
-            #])
-            #tags = {name: str.join('', chars) for name, chars in tags.items()}
-            tags, num_valids, num_skipped = tag_tokens_with_annotation_list(
-                tokens_with_offsets, [
-                    {'attribute': attribute, 'html_offset': html_offset}
-                    for attribute, html_offset in zip(attributes, html_offsets)
-                ]
-            )
 
-            extended_tags = [
-                #[' '] * len(tokens)
-                ' ' * len(tokens)
-                for _ in range(len(attribute_names))
-            ]
-            #ene = example['ENE']
-            #ene = examples['ENE'][index]
-            attribute_name_set = map_ene_to_attribute_name_set[ene]
-            #for attribute_name, tags in example['tags'].items():
-            #    attribute_id = map_attribute_name_to_id[attribute_name]
-            #    if ene not in attribute_name_set:
-            #        extended_tags[attribute_id] = [' '] * len(tokens)
-            #logger.debug('# extended_tags: %s', len(extended_tags))
-            for attribute_name in attribute_name_set:
-                attribute_id = map_attribute_name_to_id[attribute_name]
-                #logger.debug('attribute_id: %s', attribute_id)
-                if attribute_name in tags:
-                    extended_tags[attribute_id] = str.join('', tags[attribute_name])
-                    #extended_tags[attribute_id] = tags[attribute_name]
-                else:
-                    extended_tags[attribute_id] = 'O' * len(tokens)
-                    #extended_tags[attribute_id] = ['O'] * len(tokens)
-            examples['tokens'].append(tokens)
-            examples['tags'].append(extended_tags)
-
-            #extended_tags = np.array(extended_tags) 
-            #logger.debug('extended_tags: %s', extended_tags)
-            #logger.debug('extended_tags type: %s', type(extended_tags))
-        
-        #logger.debug('tags: %s', tags)
-        #return {
-        #    'tokens': tokens,
-        #    #'tags': tags,
-        #    'tags': extended_tags,
-        #}
-        return examples
-    #dataset = dataset.map(tokenize_and_tag, desc='Tokenizing and tagging')
-
-    # ページ毎にトークン長 x 属性名数とデータセット内部で配列サイズ上限をオーバーフローするらしく
-    # 後述のウィンドウ化と同時に行う必要がありそう
+    # デフォルトの writer_batch_size は 1000 で、
+    # 1サンプルのサイズが大きい場合に結合に失敗することがあるので制限する必要がある
     dataset = dataset.map(
         tokenize_and_tag,
-        #batched=True,
         desc='Tokenizing and tagging',
         writer_batch_size=1,
         num_proc=args.num_workers,
@@ -550,9 +487,6 @@ def main():
                 'page_id', 'window_id', 'title', 'category_name', 'ENE', 'tokens', 'tags'
             ]
         }
-        #del examples['tokens']
-        #del examples['tags']
-        #return examples
         for page_id, title, category_name, ene, tokens, tags in zip(
             examples['page_id'],
             examples['title'],
