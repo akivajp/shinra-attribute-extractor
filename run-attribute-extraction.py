@@ -16,6 +16,7 @@ from datasets import (
 
 import evaluate
 
+import numpy as np
 import torch
 from torch.nn.utils.rnn import pad_sequence
 
@@ -229,12 +230,21 @@ def parse_args():
     )
 
     parser.add_argument(
-        "--split_eval_ratio",
+        "--split_eval_size",
         type=float,
         default=0.1,
         help=(
             "A float value between 0 and 1 indicating "
             "the ratio of the splitted eval dataset size"
+        ),
+    )
+
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=1,
+        help=(
+            "The number of workers to use for the dataset processing."
         ),
     )
 
@@ -377,6 +387,7 @@ def main():
     attribute_names = sorted(set_attribute_names)
     map_attribute_name_to_id = {name: i for i, name in enumerate(attribute_names)}
     num_attribute_names = len(attribute_names)
+    #logger.debug('attribute_names: %s', attribute_names)
 
     # HTML をクリーニング
     # (属性値抽出の対象とならないであろう箇所を除去)
@@ -384,72 +395,211 @@ def main():
     def clean_context_html(example):
         cleaned_html = clean_up_html(example['context_html'])
         return {'context_html': cleaned_html}
-    dataset = dataset.map(clean_context_html, desc='Cleaning HTML files')
+    #dataset = dataset.map(clean_context_html, desc='Cleaning HTML files')
+    dataset = dataset.map(
+        clean_context_html,
+        desc='Cleaning HTML files',
+        num_proc=args.num_workers,
+    )
     logger.debug('dataset: %s', dataset)
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name_or_path,
     )
 
+    if args.split_eval_size> 0:
+        split_eval_size = args.split_eval_size
+        if split_eval_size >= 1:
+            split_eval_size = int(split_eval_size)
+        # ラベル付きデータを訓練用と評価用に分割
+        # ページ単位で分割することが好ましいので、ウィンドウ化よりも前に行う必要あり
+        dataset = dataset['train'].train_test_split(
+            test_size=split_eval_size,
+            seed=args.seed
+        )
+        logger.debug('dataset: %s', dataset)
+
     # トークン化と IOB2 タグの付与
     def tokenize_and_tag(example):
         tokens_with_offsets = tokenize_with_offsets(tokenizer, example['context_html'])
         tokens = [token.text for token in tokens_with_offsets]
-        tags, num_valids, num_skipped = tag_tokens_with_annotation_list(tokens_with_offsets, [
-            {'attribute': attribute, 'html_offset': html_offset}
-            for attribute, html_offset in zip(
-                example['attributes.attribute'], example['attributes.html_offset']
-            )
-        ])
-        tags = {name: str.join('', chars) for name, chars in tags.items()}
+        tags, num_valids, num_skipped = tag_tokens_with_annotation_list(
+            tokens_with_offsets,
+            [
+                {'attribute': attribute, 'html_offset': html_offset}
+                for attribute, html_offset in zip(
+                    example['attributes.attribute'], example['attributes.html_offset']
+                )
+            ]
+        )
+
+        extended_tags = [
+            #[' '] * len(tokens)
+            ' ' * len(tokens)
+            for _ in range(len(attribute_names))
+        ]
+        ene = example['ENE']
+        attribute_name_set = map_ene_to_attribute_name_set[ene]
+        for attribute_name in attribute_name_set:
+            attribute_id = map_attribute_name_to_id[attribute_name]
+            if attribute_name in tags:
+                extended_tags[attribute_id] = str.join('', tags[attribute_name])
+                #extended_tags[attribute_id] = tags[attribute_name]
+            else:
+                extended_tags[attribute_id] = 'O' * len(tokens)
+                #extended_tags[attribute_id] = ['O'] * len(tokens)
+        #examples['tokens'].append(tokens)
+        #examples['tags'].append(extended_tags)
+
         #logger.debug('tags: %s', tags)
         return {
             'tokens': tokens,
-            'tags': tags,
+            #'tags': tags,
+            'tags': extended_tags,
         }
-    dataset = dataset.map(tokenize_and_tag)
-    logger.debug('dataset: %s', dataset)
+    #def tokenize_and_tag(example):
+    def batch_tokenize_and_tag(examples):
+        #logger.debug('# examples: %d', len(examples))
+        #logger.debug('examples type: %s', type(examples))
+        #logger.debug('page_ids type: %s', type(examples['page_id']))
+        #list_tokens = []
+        examples['tokens'] = []
+        examples['tags'] = []
+        for context_html, attributes, html_offsets, ene in zip(
+            examples['context_html'],
+            examples['attributes.attribute'],
+            examples['attributes.html_offset'],
+            examples['ENE'],
+        ):
+        #for index, page_id in enumerate(examples['page_id']):
+            #context_html = examples['context_html'][index]
+            #attributes = examples['attributes.attribute'][index]
+            #html_offsets = examples['attributes.html_offset'][index]
+            tokens_with_offsets = tokenize_with_offsets(tokenizer, context_html)
+            tokens = [token.text for token in tokens_with_offsets]
+            #tags, num_valids, num_skipped = tag_tokens_with_annotation_list(tokens_with_offsets, [
+            #    {'attribute': attribute, 'html_offset': html_offset}
+            #    for attribute, html_offset in zip(
+            #        example['attributes.attribute'], example['attributes.html_offset']
+            #    )
+            #])
+            #tags = {name: str.join('', chars) for name, chars in tags.items()}
+            tags, num_valids, num_skipped = tag_tokens_with_annotation_list(
+                tokens_with_offsets, [
+                    {'attribute': attribute, 'html_offset': html_offset}
+                    for attribute, html_offset in zip(attributes, html_offsets)
+                ]
+            )
 
-    if args.split_eval_ratio > 0:
-        dataset = dataset['train'].train_test_split(
-            test_size=args.split_eval_ratio, seed=args.seed
-        )
+            extended_tags = [
+                #[' '] * len(tokens)
+                ' ' * len(tokens)
+                for _ in range(len(attribute_names))
+            ]
+            #ene = example['ENE']
+            #ene = examples['ENE'][index]
+            attribute_name_set = map_ene_to_attribute_name_set[ene]
+            #for attribute_name, tags in example['tags'].items():
+            #    attribute_id = map_attribute_name_to_id[attribute_name]
+            #    if ene not in attribute_name_set:
+            #        extended_tags[attribute_id] = [' '] * len(tokens)
+            #logger.debug('# extended_tags: %s', len(extended_tags))
+            for attribute_name in attribute_name_set:
+                attribute_id = map_attribute_name_to_id[attribute_name]
+                #logger.debug('attribute_id: %s', attribute_id)
+                if attribute_name in tags:
+                    extended_tags[attribute_id] = str.join('', tags[attribute_name])
+                    #extended_tags[attribute_id] = tags[attribute_name]
+                else:
+                    extended_tags[attribute_id] = 'O' * len(tokens)
+                    #extended_tags[attribute_id] = ['O'] * len(tokens)
+            examples['tokens'].append(tokens)
+            examples['tags'].append(extended_tags)
+
+            #extended_tags = np.array(extended_tags) 
+            #logger.debug('extended_tags: %s', extended_tags)
+            #logger.debug('extended_tags type: %s', type(extended_tags))
+        
+        #logger.debug('tags: %s', tags)
+        #return {
+        #    'tokens': tokens,
+        #    #'tags': tags,
+        #    'tags': extended_tags,
+        #}
+        return examples
+    #dataset = dataset.map(tokenize_and_tag, desc='Tokenizing and tagging')
+
+    # ページ毎にトークン長 x 属性名数とデータセット内部で配列サイズ上限をオーバーフローするらしく
+    # 後述のウィンドウ化と同時に行う必要がありそう
+    dataset = dataset.map(
+        tokenize_and_tag,
+        #batched=True,
+        desc='Tokenizing and tagging',
+        writer_batch_size=1,
+        num_proc=args.num_workers,
+    )
+    #logger.debug('dataset: %s', dataset)
 
     # 通常、512トークンを超える系列の処理はそのままできないため、
     # スライドウィンドウを用いて分割する
     # (データセットのチャンク分割はバッチ処理でのみ可能)
-    def split_into_windows(examples):
+    def batch_split_into_windows(examples):
         windows = {
             field: []
             for field in [
                 'page_id', 'window_id', 'title', 'category_name', 'ENE', 'tokens', 'tags'
             ]
         }
-        for index, page_id in enumerate(examples['page_id']):
-            tokens = examples['tokens'][index]
-            tags = examples['tags'][index]
+        #del examples['tokens']
+        #del examples['tags']
+        #return examples
+        for page_id, title, category_name, ene, tokens, tags in zip(
+            examples['page_id'],
+            examples['title'],
+            examples['category_name'],
+            examples['ENE'],
+            examples['tokens'],
+            examples['tags'],
+        ):
+        #for index, page_id in enumerate(examples['page_id']):
+            #tokens = examples['tokens'][index]
+            #tags = examples['tags'][index]
             #for i in range(0, len(tokens), args.window_size - args.window_overlap_size):
             for window_id, i in enumerate(
                 range(0, len(tokens), args.window_size - args.window_overlap_size)
             ):
                 window_tokens = tokens[i:i+args.window_size]
-                window_tags = {
-                    attribute_name: tag_list[i:i+args.window_size]
-                    for attribute_name, tag_list in tags.items() if tag_list is not None
-                }
+                #window_tags = {
+                #    attribute_name: tag_list[i:i+args.window_size]
+                #    for attribute_name, tag_list in tags.items() if tag_list is not None
+                #}
+                window_tags = [tag_list[i:i+args.window_size] for tag_list in tags]
+                #logger.debug('window_tags: %s', window_tags)
                 windows['page_id'].append(page_id)
                 windows['window_id'].append(window_id)
-                windows['title'].append(examples['title'][index])
-                windows['category_name'].append(examples['category_name'][index])
-                windows['ENE'].append(examples['ENE'][index])
+                #windows['title'].append(examples['title'][index])
+                windows['title'].append(title)
+                #windows['category_name'].append(examples['category_name'][index])
+                windows['category_name'].append(category_name)
+                #windows['ENE'].append(examples['ENE'][index])
+                windows['ENE'].append(ene)
                 windows['tokens'].append(window_tokens)
                 windows['tags'].append(window_tags)
+        #del windows['tags']
+        #logger.debug('# examples: %s', len(examples['page_id']))
+        #logger.debug('# windows: %s', len(windows['page_id']))
         return windows
     #dataset['train'] = dataset['train'].map(
     dataset = dataset.map(
-        split_into_windows,
+        batch_split_into_windows,
+        desc='Splitting into slide windows',
+        #lambda examples: batch_split_into_windows(batch_tokenize_and_tag(examples)),
+        #desc='Tokenizing, tagging and splitting into slide windows',
         batched=True,
-        remove_columns=dataset['train'].column_names
+        remove_columns=dataset['train'].column_names,
+        batch_size=1,
+        writer_batch_size=1,
+        num_proc=args.num_workers,
     )
     logger.debug('dataset: %s', dataset)
     #logger.debug('dataset["train"][0]: %s', dataset['train'][0])
@@ -479,23 +629,29 @@ def main():
     # トークン ID とタグ ID の付与
     def prepare_ids(example):
         token_ids = tokenizer.encode(example['tokens'])
+        #tag_ids = [
+        #    [map_tag_to_id['O']] * len(token_ids)
+        #    for _ in range(len(attribute_names))
+        #]
+        # 先頭 (CLS), 末尾 (SEP) はタグの予測不要
+        # BIO以外の文字(空白)はタグの予測不要
         tag_ids = [
-            [map_tag_to_id['O']] * len(token_ids)
-            for _ in range(len(attribute_names))
+            [-100] + [map_tag_to_id.get(char, -100) for char in tag_str] + [-100]
+            for tag_str in example['tags']
         ]
-        #tag_ids = [map_tag_to_id[tag] for tag in example['tags']]
-        for attribute_name, tags in example['tags'].items():
-            attribute_id = map_attribute_name_to_id[attribute_name]
-            ene = example['ENE']
-            attirbute_name_set = map_ene_to_attribute_name_set[ene]
-            if ene not in attirbute_name_set:
-                tag_ids[attribute_id] = [-100] * len(token_ids)
-            if tags is None:
-                continue
-            tag_ids[attribute_id][0] = -100
-            for index, tag in enumerate(tags):
-                tag_ids[attribute_id][index+1] = map_tag_to_id[tag]
-            tag_ids[attribute_id][-1] = -100
+        #logger.debug('tag_ids: %s', tag_ids)
+        #for attribute_name, tags in example['tags'].items():
+        #    attribute_id = map_attribute_name_to_id[attribute_name]
+        #    ene = example['ENE']
+        #    attirbute_name_set = map_ene_to_attribute_name_set[ene]
+        #    if ene not in attirbute_name_set:
+        #        tag_ids[attribute_id] = [-100] * len(token_ids)
+        #    if tags is None:
+        #        continue
+        #    tag_ids[attribute_id][0] = -100
+        #    for index, tag in enumerate(tags):
+        #        tag_ids[attribute_id][index+1] = map_tag_to_id[tag]
+        #    tag_ids[attribute_id][-1] = -100
         #logger.debug('token_ids: %s', token_ids)
         #logger.debug('tag_ids: %s', tag_ids)
         return {
@@ -506,7 +662,13 @@ def main():
             #'labels': tag_ids[0],
         }
     #dataset['train'] = dataset['train'].map(prepare_ids, remove_columns=dataset['train'].column_names)
-    dataset = dataset.map(prepare_ids, remove_columns=dataset['train'].column_names)
+    dataset = dataset.map(
+        prepare_ids,
+        remove_columns=dataset['train'].column_names,
+        desc='Converting tokens and tags into ids',
+        writer_batch_size=1,
+        num_proc=args.num_workers,
+    )
     logger.debug('dataset: %s', dataset)
     #logger.debug('dataset["train"][0]: %s', dataset['train'][0])
 
