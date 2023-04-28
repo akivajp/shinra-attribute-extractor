@@ -5,7 +5,18 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
+
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Union,
+)
 
 import datasets
 from datasets import (
@@ -196,8 +207,8 @@ def parse_args():
         "--checkpointing_steps",
         type=int,
         #default=None,
-        #default=500,
-        default=100,
+        default=500,
+        #default=100,
         help=
             "The various states should be saved at the end of every n steps."
             
@@ -318,6 +329,60 @@ class TokenMultiClassificationModel(transformers.PreTrainedModel):
             logits=logits,
         )
 
+def slice_batch_from_keys(
+    batch: Mapping[str, Iterable],
+    keys: Iterable[str],
+):
+    '''
+    keys (取得したい特徴量名一覧) を元に
+    Dict[str, Iterable] (厳密にはLazyDict) から
+    Iterable[Dict[str, Any]] に変換する
+    '''
+    if not keys:
+        raise ValueError('keys must not be empty')
+    map_key_to_index = {key: i for i, key in enumerate(keys)}
+    for example in zip(*(batch[key] for key in keys)):
+        yield {
+            key: example[map_key_to_index[key]]
+            for key in keys
+        }
+
+def convert_example_mapper_to_batch_mapper(
+    example_mapper: Callable[[Dict[str, Any]], Dict[str,Any]|List[Dict[str,Any]]],
+    keys: Iterable[str],
+):
+    '''
+    example_mapper (Iterable[Dict[str, Any]]) を
+    batch_mapper (Iterable[Dict[str, Any]]) に変換する
+    '''
+    def batch_mapper(batch):
+        map_key_to_list_features = None
+        #for sample in slice_batch_from_keys(batch, keys):
+        #for mapped in slice_batch_from_keys(batch, keys):
+        for example in slice_batch_from_keys(batch, keys):
+            #mapped_sample = sample_mapper(sample)
+            mapped = example_mapper(example)
+            if isinstance(mapped, dict):
+                # 1つのサンプルで1つのマップ結果が返された場合
+                # 単一要素のリストとして扱う
+                mapped_examples = [mapped]
+            elif isinstance(mapped, list):
+                # 複数のサンプルが返された場合
+                # (e.g. テキストを複数の文に分割した場合)
+                mapped_examples = mapped
+            else:
+                raise ValueError(f'mapped is not dict or list: {mapped}')
+            for mapped_example in mapped_examples:
+                if map_key_to_list_features is None:
+                    # 最初に取得したサンプルの特徴量名一覧を元に
+                    # Dict[str, list] を用意する
+                    map_key_to_list_features = {
+                        key: [] for key in mapped_example.keys()
+                    }
+                for key, feature in mapped_example.items():
+                    map_key_to_list_features[key].append(feature)
+        return map_key_to_list_features
+    return batch_mapper
 
 def main():
     args = parse_args() 
@@ -383,7 +448,7 @@ def main():
     # NOTE: 超重要
     #   Dict[str,Set] で事足りることだけど、
     #   何故か Dataset.map()の適用関数内でsetオブジェクトに依存すると
-    #   関数が同一視できなくなるらしくキャッシュロードできなくなるので
+    #   関数が同一視できなくなるらしくキャッシュロードできなくなるので(不具合?)
     #   計算量的に Dict[str,Dict] で代用する
     #   ついでに属性の出現回数でもカウントしておく
     #map_ene_to_attribute_name_set: dict[str,set] = {}
@@ -406,15 +471,23 @@ def main():
     #logger.debug('attribute_names: %s', attribute_names)
 
     # HTML をクリーニング
-    # (属性値抽出の対象とならないであろう箇所を除去)
-    # (HTMLタグは一般的なサブワード分割と相性が悪く)
+    # 属性値抽出の対象とならないであろう箇所を除去
+    # HTMLタグは一般的なサブワード分割と相性が悪く
+    # 無駄にトークン数が増えてしまうのは防ぎたい
     def clean_context_html(example):
         cleaned_html = clean_up_html(example['context_html'])
         return {'context_html': cleaned_html}
-    #dataset = dataset.map(clean_context_html, desc='Cleaning HTML files')
+    # デフォルトの batch_size=1000 だと処理1回の負荷が大きすぎる
     dataset = dataset.map(
-        clean_context_html,
+        #clean_context_html,
+        convert_example_mapper_to_batch_mapper(clean_context_html, ['context_html']),
+        batched=True,
         desc='Cleaning HTML files',
+        #batch_size=1,
+        #batch_size=100,
+        #batch_size=10,
+        batch_size=10,
+        writer_batch_size=10,
         num_proc=args.num_workers,
     )
     logger.debug('dataset: %s', dataset)
@@ -422,19 +495,6 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name_or_path,
     )
-
-    if args.split_eval_size> 0:
-        split_eval_size = args.split_eval_size
-        if split_eval_size >= 1:
-            split_eval_size = int(split_eval_size)
-        # ラベル付きデータを訓練用と評価用に分割
-        # ページ単位で分割することが好ましいので、ウィンドウ化よりも前に行う必要あり
-        dataset = dataset['train'].train_test_split(
-            test_size=split_eval_size,
-            seed=args.seed
-        )
-        logger.debug('dataset: %s', dataset)
-    #logger.debug('dataset test page_id: %s', dataset['test']['page_id'])
 
     # トークン化と IOB2 タグの付与
     def tokenize_and_tag(example):
@@ -449,10 +509,11 @@ def main():
                 )
             ]
         )
-        extended_tags = [
-            ' ' * len(tokens)
-            for _ in range(len(attribute_names))
-        ]
+        #extended_tags = [
+        #    ' ' * len(tokens)
+        #    for _ in range(len(attribute_names))
+        #]
+        extended_tags = [None] * num_attribute_names
         ene = example['ENE']
         attribute_name_counter = map_ene_to_attribute_name_counter[ene]
         for attribute_name in attribute_name_counter:
@@ -466,77 +527,86 @@ def main():
             'tokens': tokens,
             'tags': extended_tags,
         }
-
+    
     # デフォルトの writer_batch_size は 1000 で、
     # 1サンプルのサイズが大きい場合に結合に失敗することがあるので制限する必要がある
+    # writer_batch_size=100, batch_size=100 でもちょっと怪しい
     dataset = dataset.map(
-        tokenize_and_tag,
+        #tokenize_and_tag,
+        convert_example_mapper_to_batch_mapper(tokenize_and_tag, [
+            'context_html',
+            'attributes.attribute',
+            'attributes.html_offset',
+            'ENE',
+        ]),
+        batched=True,
         desc='Tokenizing and tagging',
-        writer_batch_size=1,
+        batch_size=10,
+        writer_batch_size=10,
         num_proc=args.num_workers,
     )
     #logger.debug('dataset: %s', dataset)
 
+    if args.split_eval_size> 0:
+        split_eval_size = args.split_eval_size
+        if split_eval_size >= 1:
+            split_eval_size = int(split_eval_size)
+        # ラベル付きデータを訓練用と評価用に分割
+        # ページ単位で分割することが好ましいので、ウィンドウ化よりも前に行う必要あり
+        dataset = dataset['train'].train_test_split(
+            test_size=split_eval_size,
+            seed=args.seed
+        )
+        logger.debug('dataset: %s', dataset)
+    #logger.debug('dataset test page_id: %s', dataset['test']['page_id'])
+
     # 通常、512トークンを超える系列の処理はそのままできないため、
     # スライドウィンドウを用いて分割する
     # (データセットのチャンク分割はバッチ処理でのみ可能)
-    def batch_split_into_windows(examples):
-        windows = {
-            field: []
-            for field in [
-                'page_id', 'window_id', 'title', 'category_name', 'ENE', 'tokens', 'tags'
-            ]
-        }
-        for page_id, title, category_name, ene, tokens, tags in zip(
-            examples['page_id'],
-            examples['title'],
-            examples['category_name'],
-            examples['ENE'],
-            examples['tokens'],
-            examples['tags'],
+    def split_into_windows(example):
+        windows = []
+        tokens = example['tokens']
+        tags = example['tags']
+        for window_id, i in enumerate(
+            range(0, len(tokens), args.window_size - args.window_overlap_size)
         ):
-        #for index, page_id in enumerate(examples['page_id']):
-            #tokens = examples['tokens'][index]
-            #tags = examples['tags'][index]
-            #for i in range(0, len(tokens), args.window_size - args.window_overlap_size):
-            for window_id, i in enumerate(
-                range(0, len(tokens), args.window_size - args.window_overlap_size)
-            ):
-                window_tokens = tokens[i:i+args.window_size]
-                #window_tags = {
-                #    attribute_name: tag_list[i:i+args.window_size]
-                #    for attribute_name, tag_list in tags.items() if tag_list is not None
-                #}
-                window_tags = [tag_list[i:i+args.window_size] for tag_list in tags]
-                #logger.debug('window_tags: %s', window_tags)
-                windows['page_id'].append(page_id)
-                windows['window_id'].append(window_id)
-                #windows['title'].append(examples['title'][index])
-                windows['title'].append(title)
-                #windows['category_name'].append(examples['category_name'][index])
-                windows['category_name'].append(category_name)
-                #windows['ENE'].append(examples['ENE'][index])
-                windows['ENE'].append(ene)
-                windows['tokens'].append(window_tokens)
-                windows['tags'].append(window_tags)
-        #del windows['tags']
-        #logger.debug('# examples: %s', len(examples['page_id']))
-        #logger.debug('# windows: %s', len(windows['page_id']))
+            window_tokens = tokens[i:i+args.window_size]
+            #window_tags = [tag_list[i:i+args.window_size] for tag_list in tags]
+            window_tags = [
+                tag_list[i:i+args.window_size] if tag_list is not None
+                else None
+                for tag_list in tags
+            ]
+            window = {}
+            window['page_id'] = example['page_id']
+            window['title'] = example['title']
+            window['category_name'] = example['category_name']
+            window['ENE'] = example['ENE']
+            window['window_id'] = window_id
+            window['tokens'] = window_tokens
+            window['tags'] = window_tags
+            windows.append(window)
         return windows
-    #dataset['train'] = dataset['train'].map(
+    
     dataset = dataset.map(
-        batch_split_into_windows,
+        #split_into_windows,
+        convert_example_mapper_to_batch_mapper(split_into_windows, [
+            'page_id',
+            'title',
+            'category_name',
+            'ENE',
+            'tokens',
+            'tags',
+            'tokens',
+        ]),
         desc='Splitting into slide windows',
-        #lambda examples: batch_split_into_windows(batch_tokenize_and_tag(examples)),
-        #desc='Tokenizing, tagging and splitting into slide windows',
         batched=True,
         remove_columns=dataset['train'].column_names,
-        batch_size=1,
-        writer_batch_size=1,
+        batch_size=10,
+        writer_batch_size=10,
         num_proc=args.num_workers,
     )
     logger.debug('dataset: %s', dataset)
-    #logger.debug('dataset["train"][0]: %s', dataset['train'][0])
 
     tag_list = ['O', 'B', 'I']
     map_tag_to_id = {tag: i for i, tag in enumerate(tag_list)}
@@ -563,44 +633,28 @@ def main():
     # トークン ID とタグ ID の付与
     def prepare_ids(example):
         token_ids = tokenizer.encode(example['tokens'])
-        #tag_ids = [
-        #    [map_tag_to_id['O']] * len(token_ids)
-        #    for _ in range(len(attribute_names))
-        #]
         # 先頭 (CLS), 末尾 (SEP) はタグの予測不要
         # BIO以外の文字(空白)はタグの予測不要
         tag_ids = [
             [-100] + [map_tag_to_id.get(char, -100) for char in tag_str] + [-100]
+            if tag_str is not None
+            else None
             for tag_str in example['tags']
         ]
-        #logger.debug('tag_ids: %s', tag_ids)
-        #for attribute_name, tags in example['tags'].items():
-        #    attribute_id = map_attribute_name_to_id[attribute_name]
-        #    ene = example['ENE']
-        #    attirbute_name_set = map_ene_to_attribute_name_set[ene]
-        #    if ene not in attirbute_name_set:
-        #        tag_ids[attribute_id] = [-100] * len(token_ids)
-        #    if tags is None:
-        #        continue
-        #    tag_ids[attribute_id][0] = -100
-        #    for index, tag in enumerate(tags):
-        #        tag_ids[attribute_id][index+1] = map_tag_to_id[tag]
-        #    tag_ids[attribute_id][-1] = -100
-        #logger.debug('token_ids: %s', token_ids)
-        #logger.debug('tag_ids: %s', tag_ids)
         return {
-            #'token_ids': token_ids,
             'input_ids': token_ids,
             'tag_ids': tag_ids,
-            #'labels': tag_ids,
-            #'labels': tag_ids[0],
         }
-    #dataset['train'] = dataset['train'].map(prepare_ids, remove_columns=dataset['train'].column_names)
     dataset = dataset.map(
-        prepare_ids,
-        remove_columns=dataset['train'].column_names,
+        #prepare_ids,
+        convert_example_mapper_to_batch_mapper(prepare_ids, [
+            'tokens',
+            'tags',
+        ]),
+        batched=True,
         desc='Converting tokens and tags into ids',
-        writer_batch_size=1,
+        batch_size=10,
+        writer_batch_size=10,
         num_proc=args.num_workers,
     )
     logger.debug('dataset: %s', dataset)
@@ -609,17 +663,55 @@ def main():
     train_dataset = dataset['train']
     eval_dataset = dataset['test']
 
+    map_page_id_to_information = {}
+    def record_information(example):
+        keys = [
+            'page_id',
+            'title',
+            'category_name',
+            'ENE',
+        ]
+        page_id = example['page_id']
+        info = {
+            key: example[key] for key in keys
+        }
+        map_page_id_to_information[page_id] = info
+    raw_dataset.map(
+        record_information,
+        desc='Recording page information',
+    )
+
+    #resuming = False
+    skip_collation = False
     # ミニバッチ生成のための追加処理
     def my_collator(examples):
+        # 全タグのtensor生成もそこそこコストが高いので、
+        # resuming中に無駄なtensorを生成させない
+        #if resuming:
+        #    return
+        if skip_collation:
+            return
         input_ids = [
             torch.tensor(example['input_ids'], dtype=torch.int64)
             for example in examples
         ]
         # cuda の nll_loss のターゲットは long にしか対応していない模様
         tag_ids = [
-            torch.tensor(example['tag_ids'], dtype=torch.int64).transpose(1, 0)
+            [
+                tag_id_list if tag_id_list is not None
+                else [-100] * len(example['input_ids'])
+                for tag_id_list in example['tag_ids']
+            ]
             for example in examples
-        ]
+        ] # [batch_size, num_attribute_names, window_length]
+        #tag_ids = [
+        #    torch.tensor(example['tag_ids'], dtype=torch.int64).transpose(1, 0)
+        #    for example in examples
+        #]
+        tag_ids = [
+            torch.tensor(tag_id_list, dtype=torch.int64).transpose(1, 0) # [A, L] -> [L, A]
+            for tag_id_list in tag_ids
+        ] # [batch_size, window_length, num_attribute_names]
         mask = [
             torch.ones(len(ids), dtype=torch.bool) for ids in input_ids
         ]
@@ -632,6 +724,7 @@ def main():
             'tag_ids': pad_sequence(tag_ids, batch_first=True, padding_value=-100),
             'attention_mask': pad_sequence(mask, batch_first=True),
             'token_type_ids': pad_sequence(token_type_ids, batch_first=True),
+            'page_id': [example['page_id'] for example in examples],
         }
     data_collator = my_collator
         
@@ -640,11 +733,13 @@ def main():
         shuffle=True,
         collate_fn=data_collator,
         batch_size=args.per_device_train_batch_size,
+        num_workers=args.num_workers,
     )
     eval_dataloader = DataLoader(
         eval_dataset,
         collate_fn=data_collator,
         batch_size=args.per_device_eval_batch_size,
+        num_workers=args.num_workers,
     )
     logger.debug('train_dataloader: %s', train_dataloader)
 
@@ -730,22 +825,43 @@ def main():
 
         batch_size = y_pred.shape[0]
         seq_len = y_pred.shape[1]
-        # [B, N, A] -> [B, A, N] -> [B*A, N]
+        # [B, L, A] -> [B, A, L]
+        #y_pred = y_pred.transpose(0, 2, 1)
+        #y_true = y_true.transpose(0, 2, 1)
+        # [B, L, A] -> [B, A, L] -> [B*A, L]
         y_pred = y_pred.transpose(0, 2, 1).reshape(batch_size*num_attribute_names, seq_len)
         y_true = y_true.transpose(0, 2, 1).reshape(batch_size*num_attribute_names, seq_len)
+        # [B, L, A] -> [A, B, L]
 
         # Remove ignored index (special tokens)
-        true_predictions = [
-            #[label_list[p] for (p, l) in zip(pred, gold_label) if l != -100]
-            [tag_list[p] for (p, l) in zip(pred, gold_label) if l != -100]
-            for pred, gold_label in zip(y_pred, y_true)
-        ]
-        true_labels = [
-            #[label_list[l] for (p, l) in zip(pred, gold_label) if l != -100]
-            [tag_list[l] for (p, l) in zip(pred, gold_label) if l != -100]
-            for pred, gold_label in zip(y_pred, y_true)
-        ]
-        return true_predictions, true_labels
+        #true_predictions = [
+        #    [tag_list[p] for (p, l) in zip(pred, gold_label) if l != -100]
+        #    for pred, gold_label in zip(y_pred, y_true)
+        #    if gold_label[1] != -100
+        #]
+        #true_labels = [
+        #    [tag_list[l] for (p, l) in zip(pred, gold_label) if l != -100]
+        #    for pred, gold_label in zip(y_pred, y_true)
+        #    if gold_label[1] != -100
+        #]
+        #return true_predictions, true_labels
+        true_pred = []
+        true_labels = []
+        for pred, gold_label in zip(y_pred, y_true):
+            if gold_label[1] == -100:
+                # 2番目のトークンが分類不要なら系列ごと分類不要
+                continue
+            seq_pred = []
+            seq_labels = []
+            for p, l in zip(pred, gold_label):
+                if l == -100:
+                    # 分類不要なら無視
+                    continue
+                seq_pred.append(tag_list[p])
+                seq_labels.append(tag_list[l])
+            true_pred.append(seq_pred)
+            true_labels.append(seq_labels)
+        return true_pred, true_labels
 
     def compute_metrics():
         results = metric.compute()
@@ -786,13 +902,6 @@ def main():
     # Potentially load in the weights and states from a previous save
     resume_path = None
 
-    status_path = os.path.join(args.output_dir, "status.json")
-    status = {}
-    if os.path.isfile(status_path):
-        with open(status_path, "r", encoding='utf-8') as f:
-            status = json.load(f)
-            logger.debug('Loaded status: %s', status)
- 
     if args.resume_from_checkpoint:
     #if args.resume_from_checkpoint is not None or args.resume_from_checkpoint != "":
     #if args.resume_from_checkpoint is not None and args.resume_from_checkpoint != "":
@@ -800,11 +909,15 @@ def main():
         accelerator.load_state(args.resume_from_checkpoint)
         #path = os.path.basename(args.resume_from_checkpoint)
         resume_path = os.path.basename(args.resume_from_checkpoint)
+        #resuming = True
     else:
         # Get the most recent checkpoint
         dirs = [
             os.path.join(args.output_dir, f.name)
             for f in os.scandir(args.output_dir) if f.is_dir()
+        ]
+        dirs = [
+            d for d in dirs if os.path.isfile(os.path.join(d, "status.json"))
         ]
         if len(dirs) > 0:
             #dirs.sort(key=os.path.getctime)
@@ -816,27 +929,43 @@ def main():
             #resume_path = get_last_checkpoint(args.output_dir)
             #logger.debug('resume_path: %s', resume_path)
             accelerator.load_state(resume_path)
+            #resuming = True
     logger.debug('resume_path: %s', resume_path)
 
     starting_epoch = 0
     resume_step = -1
     eval_metric = None
 
-    # Extract `epoch_{i}` or `step_{i}`
+    status_path = os.path.join(args.output_dir, "status.json")
+    status = {}
     if resume_path:
-        training_difference = os.path.splitext(resume_path)[0]
-        logger.debug('training_difference: %s', training_difference)
-
-        if "epoch_" in training_difference and "_step_" in training_difference:
-            resume_step = int(training_difference.split("_")[-1])
-            starting_epoch = resume_step // len(train_dataloader)
+        with open(os.path.join(resume_path, 'status.json'), "r", encoding='utf-8') as f:
+            status = json.load(f)
+            logger.debug('Loaded status: %s', status)
+            starting_epoch = status['last_epoch']
+            resume_step = status['last_step']
             resume_step -= starting_epoch * len(train_dataloader)
-        else:
-            raise ValueError(f'Failed to parse training_difference: {training_difference}')
+    elif os.path.isfile(status_path):
+        with open(status_path, "r", encoding='utf-8') as f:
+            status = json.load(f)
+            logger.debug('Loaded status: %s', status)
+
+    # Extract `epoch_{i}` or `step_{i}`
+    #if resume_path:
+    #    training_difference = os.path.splitext(resume_path)[0]
+    #    logger.debug('training_difference: %s', training_difference)
+
+    #    if "epoch_" in training_difference and "_step_" in training_difference:
+    #        resume_step = int(training_difference.split("_")[-1])
+    #        starting_epoch = resume_step // len(train_dataloader)
+    #        resume_step -= starting_epoch * len(train_dataloader)
+    #    else:
+    #        raise ValueError(f'Failed to parse training_difference: {training_difference}')
     logger.debug('starting_epoch: %d', starting_epoch)
     logger.debug('resume_step: %d', resume_step)
 
     def save_best_status(eval_metric):
+        status['last_epoch'] = epoch
         status['last_step'] = completed_steps
         for key in ['precision', 'recall', 'f1']:
             last_key = f'eval_{key}_last'
@@ -847,15 +976,27 @@ def main():
                 status[best_key] = status[last_key]
                 status[best_step_key] = status['last_step']
                 logger.debug('New best %s: %f', key, status[best_key])
+                output_dir = f'best_eval_{key}'
+                do_save(output_dir)
         with open(status_path, "w", encoding='utf-8') as f:
             json.dump(status, f, indent=2, sort_keys=True, ensure_ascii=False)
 
     def do_eval():
         model.eval()
         samples_seen = 0
-        for step, batch in enumerate(eval_dataloader):
+        #for step, batch in enumerate(eval_dataloader):
+        for step, batch in enumerate(tqdm(
+            eval_dataloader,
+            desc='Feeding for evaluation',
+        )):
             with torch.no_grad():
-                outputs = model(**batch)
+                #outputs = model(**batch)
+                outputs = model(
+                    input_ids = batch['input_ids'],
+                    tag_ids = batch['tag_ids'],
+                    attention_mask = batch.get('attention_mask'),
+                    token_type_ids = batch.get('token_type_ids'),
+                )
             predictions = outputs.logits.argmax(dim=-1)
             tag_ids = batch["tag_ids"]
             predictions_gathered, tags_gathered = accelerator.gather([predictions, tag_ids])
@@ -879,36 +1020,70 @@ def main():
                 predictions=preds,
                 references=refs,
             )
+        logger.debug('Computing metrics...')
         eval_metric = compute_metrics()
+        logger.debug('Finished computing metrics')
         #accelerator.print(f"epoch {epoch}:", eval_metric)
         if accelerator.is_main_process:
             logger.info(f'epoch {epoch} eval_metric: {eval_metric}')
         save_best_status(eval_metric)
         return eval_metric
 
+    def do_save(output_dir):
+        status['last_epoch'] = epoch
+        status['last_step'] = completed_steps
+        if args.output_dir is not None:
+            output_dir = os.path.join(args.output_dir, output_dir)
+            accelerator.save_state(output_dir)
+            status_path = os.path.join(output_dir, 'status.json')
+            with open(status_path, "w", encoding='utf-8') as f:
+                json.dump(status, f, indent=2, sort_keys=True, ensure_ascii=False)
 
     #for epoch in range(starting_epoch, args.num_train_epochs):
     for epoch in range(0, args.num_train_epochs):
         # 学習済みのステップはスキップ
-        if starting_epoch > epoch:
+        if epoch < starting_epoch:
             completed_steps += len(train_dataloader)
             progress_bar.update(len(train_dataloader))
+            #if epoch + 1 == starting_epoch:
+            #    resuming = False
+            #if epoch + args.num_workers >= starting_epoch:
+            #    skip_collation = False
+            #else:
+            #    skip_collation = True
             continue
 
         total_loss = 0
-        zfilled_epoch = str(epoch).zfill(len(str(args.num_train_epochs - 1)))
+        #fed_samples = 0
+        fed_iterations = 0
+        zero_filled_epoch = str(epoch).zfill(len(str(args.num_train_epochs - 1)))
         for step, batch in enumerate(train_dataloader):
             if starting_epoch == epoch:
                 if step <= resume_step:
                     completed_steps += 1
                     progress_bar.update(1)
+                    #if step == resume_step:
+                    #    resuming = False
+                    if step + args.num_workers >= resume_step:
+                        skip_collation = False
+                    else:
+                        skip_collation = True
                     continue
+            resuming = False
             model.train()
-            outputs = model(**batch)
+            #outputs = model(**batch)
+            outputs = model(
+                input_ids = batch['input_ids'],
+                tag_ids = batch['tag_ids'],
+                attention_mask = batch.get('attention_mask'),
+                token_type_ids = batch.get('token_type_ids'),
+            )
             loss = outputs.loss
             # We keep track of the loss at each epoch
             total_loss += loss.detach().float()
             loss = loss / args.gradient_accumulation_steps
+            #fed_samples += len(batch["input_ids"])
+            fed_iterations += 1
             accelerator.backward(loss)
             if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                 optimizer.step()
@@ -919,14 +1094,18 @@ def main():
 
             if isinstance(checkpointing_steps, int):
                 if completed_steps % checkpointing_steps == 0:
+                    zero_filled_step = str(completed_steps).zfill(len(str(args.max_train_steps - 1)))
                     #output_dir = f"step_{completed_steps}"
-                    output_dir = f"epoch_{zfilled_epoch}_step_{completed_steps}"
-                    if args.output_dir is not None:
-                        output_dir = os.path.join(args.output_dir, output_dir)
-                    accelerator.save_state(output_dir)
+                    #output_dir = f"epoch_{zero_filled_epoch}_step_{completed_steps}"
+                    output_dir = f"epoch_{zero_filled_epoch}_step_{zero_filled_step}"
+                    #if args.output_dir is not None:
+                    #    output_dir = os.path.join(args.output_dir, output_dir)
+                    #accelerator.save_state(output_dir)
+                    do_save(output_dir)
                     if total_loss > 0:
                         train_log = {
-                            "train_loss": total_loss.item() / len(train_dataloader),
+                            #"train_loss": total_loss.item() / len(train_dataloader),
+                            "train_loss": total_loss.item() / fed_iterations,
                             "epoch": epoch,
                             "step": completed_steps,
                         }
@@ -939,7 +1118,8 @@ def main():
 
         if total_loss > 0:
             train_log = {
-                "train_loss": total_loss.item() / len(train_dataloader),
+                #"train_loss": total_loss.item() / len(train_dataloader),
+                "train_loss": total_loss.item() / fed_iterations,
                 "epoch": epoch,
                 "step": completed_steps,
             }
@@ -956,10 +1136,12 @@ def main():
 
         # 各エポック毎のモデルは毎回保存
         #output_dir = f"epoch_{epoch}"
-        output_dir = f"epoch_{zfilled_epoch}_step_{completed_steps}"
-        if args.output_dir is not None:
-            output_dir = os.path.join(args.output_dir, output_dir)
-        accelerator.save_state(output_dir)
+            zero_filled_step = str(completed_steps).zfill(len(str(args.max_train_steps - 1)))
+        output_dir = f"epoch_{zero_filled_epoch}_step_{zero_filled_step}"
+        #if args.output_dir is not None:
+        #    output_dir = os.path.join(args.output_dir, output_dir)
+        #accelerator.save_state(output_dir)
+        do_save(output_dir)
 
     if args.with_tracking:
         accelerator.end_training()
