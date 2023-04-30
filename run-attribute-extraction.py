@@ -59,6 +59,10 @@ from html_cleaning import (
     clean_up_html,
 )
 
+from preprocess import (
+    preprocess_dataset,
+)
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description=
@@ -329,61 +333,6 @@ class TokenMultiClassificationModel(transformers.PreTrainedModel):
             logits=logits,
         )
 
-def slice_batch_from_keys(
-    batch: Mapping[str, Iterable],
-    keys: Iterable[str],
-):
-    '''
-    keys (取得したい特徴量名一覧) を元に
-    Dict[str, Iterable] (厳密にはLazyDict) から
-    Iterable[Dict[str, Any]] に変換する
-    '''
-    if not keys:
-        raise ValueError('keys must not be empty')
-    map_key_to_index = {key: i for i, key in enumerate(keys)}
-    for example in zip(*(batch[key] for key in keys)):
-        yield {
-            key: example[map_key_to_index[key]]
-            for key in keys
-        }
-
-def convert_example_mapper_to_batch_mapper(
-    example_mapper: Callable[[Dict[str, Any]], Dict[str,Any]|List[Dict[str,Any]]],
-    keys: Iterable[str],
-):
-    '''
-    example_mapper (Iterable[Dict[str, Any]]) を
-    batch_mapper (Iterable[Dict[str, Any]]) に変換する
-    '''
-    def batch_mapper(batch):
-        map_key_to_list_features = None
-        #for sample in slice_batch_from_keys(batch, keys):
-        #for mapped in slice_batch_from_keys(batch, keys):
-        for example in slice_batch_from_keys(batch, keys):
-            #mapped_sample = sample_mapper(sample)
-            mapped = example_mapper(example)
-            if isinstance(mapped, dict):
-                # 1つのサンプルで1つのマップ結果が返された場合
-                # 単一要素のリストとして扱う
-                mapped_examples = [mapped]
-            elif isinstance(mapped, list):
-                # 複数のサンプルが返された場合
-                # (e.g. テキストを複数の文に分割した場合)
-                mapped_examples = mapped
-            else:
-                raise ValueError(f'mapped is not dict or list: {mapped}')
-            for mapped_example in mapped_examples:
-                if map_key_to_list_features is None:
-                    # 最初に取得したサンプルの特徴量名一覧を元に
-                    # Dict[str, list] を用意する
-                    map_key_to_list_features = {
-                        key: [] for key in mapped_example.keys()
-                    }
-                for key, feature in mapped_example.items():
-                    map_key_to_list_features[key].append(feature)
-        return map_key_to_list_features
-    return batch_mapper
-
 def main():
     args = parse_args() 
     logger.debug('args: %s', args)
@@ -425,261 +374,285 @@ def main():
     raw_dataset = load_dataset('./shinra_attribute_extraction_2022')
     logger.debug('raw_dataset: %s', raw_dataset)
 
-    dataset = raw_dataset
-
-    # 今回使わない特徴量は削除しておく
-    dataset = dataset.flatten()
-    dataset = dataset.remove_columns(['context_text', 'attributes.text_offset'])
-
-    # --target_categories が与えられた場合は、そのカテゴリのみで絞り込む
-    target_categories = None
-    if args.target_categories is not None:
-        target_categories = args.target_categories.split(',')
-        logger.debug('target_categories: %s', target_categories)
-        dataset = dataset.filter(
-            lambda e: e['category_name'] in target_categories,
-            desc='Filtering with target categories',
-        )
-    logger.debug('dataset: %s', dataset)
-
-    # 全属性名のリストと、
-    # ENE に対応する属性名のリストの辞書を作成
-    set_attribute_names = set()
-    # NOTE: 超重要
-    #   Dict[str,Set] で事足りることだけど、
-    #   何故か Dataset.map()の適用関数内でsetオブジェクトに依存すると
-    #   関数が同一視できなくなるらしくキャッシュロードできなくなるので(不具合?)
-    #   計算量的に Dict[str,Dict] で代用する
-    #   ついでに属性の出現回数でもカウントしておく
-    #map_ene_to_attribute_name_set: dict[str,set] = {}
-    map_ene_to_attribute_name_counter: dict[str,dict[str,int]] = {}
-    for example in dataset['train']:
-        ene = example['ENE']
-        for attribute_name in example['attributes.attribute']:
-            set_attribute_names.add(attribute_name)
-            # NOTE: setの代わりにdictを使う必要あり(前述の理由)
-            # if ene not in map_ene_to_attribute_name_set:
-            #     map_ene_to_attribute_name_set[ene] = set()
-            # map_ene_to_attribute_name_set[ene].add(attribute_name)
-            if ene not in map_ene_to_attribute_name_counter:
-                map_ene_to_attribute_name_counter[ene] = {}
-            count = map_ene_to_attribute_name_counter[ene].get(attribute_name, 0)
-            map_ene_to_attribute_name_counter[ene][attribute_name] = count + 1
-    attribute_names = sorted(set_attribute_names)
-    map_attribute_name_to_id = {name: i for i, name in enumerate(attribute_names)}
-    num_attribute_names = len(attribute_names)
-    #logger.debug('attribute_names: %s', attribute_names)
-
-    # HTML をクリーニング
-    # 属性値抽出の対象とならないであろう箇所を除去
-    # HTMLタグは一般的なサブワード分割と相性が悪く
-    # 無駄にトークン数が増えてしまうのは防ぎたい
-    def clean_context_html(example):
-        cleaned_html = clean_up_html(example['context_html'])
-        return {'context_html': cleaned_html}
-    # デフォルトの batch_size=1000 だと処理1回の負荷が大きすぎる
-    dataset = dataset.map(
-        #clean_context_html,
-        convert_example_mapper_to_batch_mapper(clean_context_html, ['context_html']),
-        batched=True,
-        desc='Cleaning HTML files',
-        #batch_size=1,
-        #batch_size=100,
-        #batch_size=10,
-        batch_size=10,
-        writer_batch_size=10,
-        num_proc=args.num_workers,
-    )
-    logger.debug('dataset: %s', dataset)
-
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name_or_path,
     )
 
+    #dataset = preprocess_dataset(
+    preprocess_result = preprocess_dataset(
+        raw_dataset,
+        tokenizer,
+        target_categories = args.target_categories,
+        num_workers = args.num_workers,
+        split_eval_size = args.split_eval_size,
+        seed = args.seed,
+        window_size = args.window_size,
+        window_overlap_size = args.window_overlap_size,
+    )
+    #dataset = raw_dataset
+    dataset = preprocess_result.dataset
+
+    # 今回使わない特徴量は削除しておく
+    #dataset = dataset.flatten()
+    #dataset = dataset.remove_columns(['context_text', 'attributes.text_offset'])
+
+    # --target_categories が与えられた場合は、そのカテゴリのみで絞り込む
+    #target_categories = None
+    #if args.target_categories is not None:
+    #    target_categories = args.target_categories.split(',')
+    #    logger.debug('target_categories: %s', target_categories)
+    #    dataset = dataset.filter(
+    #        lambda e: e['category_name'] in target_categories,
+    #        desc='Filtering with target categories',
+    #    )
+    #logger.debug('dataset: %s', dataset)
+
+    ## 全属性名のリストと、
+    ## ENE に対応する属性名のリストの辞書を作成
+    #set_attribute_names = set()
+    ## NOTE: 超重要
+    ##   Dict[str,Set] で事足りることだけど、
+    ##   何故か Dataset.map()の適用関数内でsetオブジェクトに依存すると
+    ##   関数が同一視できなくなるらしくキャッシュロードできなくなるので(不具合?)
+    ##   計算量的に Dict[str,Dict] で代用する
+    ##   ついでに属性の出現回数でもカウントしておく
+    ##map_ene_to_attribute_name_set: dict[str,set] = {}
+    #map_ene_to_attribute_name_counter: dict[str,dict[str,int]] = {}
+    #for example in dataset['train']:
+    #    ene = example['ENE']
+    #    for attribute_name in example['attributes.attribute']:
+    #        set_attribute_names.add(attribute_name)
+    #        # NOTE: setの代わりにdictを使う必要あり(前述の理由)
+    #        # if ene not in map_ene_to_attribute_name_set:
+    #        #     map_ene_to_attribute_name_set[ene] = set()
+    #        # map_ene_to_attribute_name_set[ene].add(attribute_name)
+    #        if ene not in map_ene_to_attribute_name_counter:
+    #            map_ene_to_attribute_name_counter[ene] = {}
+    #        count = map_ene_to_attribute_name_counter[ene].get(attribute_name, 0)
+    #        map_ene_to_attribute_name_counter[ene][attribute_name] = count + 1
+    #attribute_names = sorted(set_attribute_names)
+    #map_attribute_name_to_id = {name: i for i, name in enumerate(attribute_names)}
+    #num_attribute_names = len(attribute_names)
+    ##logger.debug('attribute_names: %s', attribute_names)
+
+    ## HTML をクリーニング
+    ## 属性値抽出の対象とならないであろう箇所を除去
+    ## HTMLタグは一般的なサブワード分割と相性が悪く
+    ## 無駄にトークン数が増えてしまうのは防ぎたい
+    #def clean_context_html(example):
+    #    cleaned_html = clean_up_html(example['context_html'])
+    #    return {'context_html': cleaned_html}
+    ## デフォルトの batch_size=1000 だと処理1回の負荷が大きすぎる
+    #dataset = dataset.map(
+    #    #clean_context_html,
+    #    convert_example_mapper_to_batch_mapper(clean_context_html, ['context_html']),
+    #    batched=True,
+    #    desc='Cleaning HTML files',
+    #    #batch_size=1,
+    #    #batch_size=100,
+    #    #batch_size=10,
+    #    batch_size=10,
+    #    writer_batch_size=10,
+    #    num_proc=args.num_workers,
+    #)
+    #logger.debug('dataset: %s', dataset)
+
+    #tokenizer = AutoTokenizer.from_pretrained(
+    #    args.model_name_or_path,
+    #)
+
     # トークン化と IOB2 タグの付与
-    def tokenize_and_tag(example):
-        tokens_with_offsets = tokenize_with_offsets(tokenizer, example['context_html'])
-        tokens = [token.text for token in tokens_with_offsets]
-        tags, num_tagged, num_skipped = tag_tokens_with_annotation_list(
-            tokens_with_offsets,
-            [
-                {'attribute': attribute, 'html_offset': html_offset}
-                for attribute, html_offset in zip(
-                    example['attributes.attribute'], example['attributes.html_offset']
-                )
-            ]
-        )
-        #extended_tags = [
-        #    ' ' * len(tokens)
-        #    for _ in range(len(attribute_names))
-        #]
-        extended_tags = [None] * num_attribute_names
-        ene = example['ENE']
-        attribute_name_counter = map_ene_to_attribute_name_counter[ene]
-        for attribute_name in attribute_name_counter:
-            attribute_id = map_attribute_name_to_id[attribute_name]
-            if attribute_name in tags:
-                extended_tags[attribute_id] = str.join('', tags[attribute_name])
-            else:
-                extended_tags[attribute_id] = 'O' * len(tokens)
-        #logger.debug('tags: %s', tags)
-        return {
-            'tokens': tokens,
-            'tags': extended_tags,
-        }
+    #def tokenize_and_tag(example):
+    #    tokens_with_offsets = tokenize_with_offsets(tokenizer, example['context_html'])
+    #    tokens = [token.text for token in tokens_with_offsets]
+    #    tags, num_tagged, num_skipped = tag_tokens_with_annotation_list(
+    #        tokens_with_offsets,
+    #        [
+    #            {'attribute': attribute, 'html_offset': html_offset}
+    #            for attribute, html_offset in zip(
+    #                example['attributes.attribute'], example['attributes.html_offset']
+    #            )
+    #        ]
+    #    )
+    #    #extended_tags = [
+    #    #    ' ' * len(tokens)
+    #    #    for _ in range(len(attribute_names))
+    #    #]
+    #    extended_tags = [None] * num_attribute_names
+    #    ene = example['ENE']
+    #    attribute_name_counter = map_ene_to_attribute_name_counter[ene]
+    #    for attribute_name in attribute_name_counter:
+    #        attribute_id = map_attribute_name_to_id[attribute_name]
+    #        if attribute_name in tags:
+    #            extended_tags[attribute_id] = str.join('', tags[attribute_name])
+    #        else:
+    #            extended_tags[attribute_id] = 'O' * len(tokens)
+    #    #logger.debug('tags: %s', tags)
+    #    return {
+    #        'tokens': tokens,
+    #        'tags': extended_tags,
+    #    }
     
     # デフォルトの writer_batch_size は 1000 で、
     # 1サンプルのサイズが大きい場合に結合に失敗することがあるので制限する必要がある
     # writer_batch_size=100, batch_size=100 でもちょっと怪しい
-    dataset = dataset.map(
-        #tokenize_and_tag,
-        convert_example_mapper_to_batch_mapper(tokenize_and_tag, [
-            'context_html',
-            'attributes.attribute',
-            'attributes.html_offset',
-            'ENE',
-        ]),
-        batched=True,
-        desc='Tokenizing and tagging',
-        batch_size=10,
-        writer_batch_size=10,
-        num_proc=args.num_workers,
-    )
+    #dataset = dataset.map(
+    #    #tokenize_and_tag,
+    #    convert_example_mapper_to_batch_mapper(tokenize_and_tag, [
+    #        'context_html',
+    #        'attributes.attribute',
+    #        'attributes.html_offset',
+    #        'ENE',
+    #    ]),
+    #    batched=True,
+    #    desc='Tokenizing and tagging',
+    #    batch_size=10,
+    #    writer_batch_size=10,
+    #    num_proc=args.num_workers,
+    #)
     #logger.debug('dataset: %s', dataset)
 
-    if args.split_eval_size> 0:
-        split_eval_size = args.split_eval_size
-        if split_eval_size >= 1:
-            split_eval_size = int(split_eval_size)
-        # ラベル付きデータを訓練用と評価用に分割
-        # ページ単位で分割することが好ましいので、ウィンドウ化よりも前に行う必要あり
-        dataset = dataset['train'].train_test_split(
-            test_size=split_eval_size,
-            seed=args.seed
-        )
-        logger.debug('dataset: %s', dataset)
-    #logger.debug('dataset test page_id: %s', dataset['test']['page_id'])
+    #if args.split_eval_size> 0:
+    #    split_eval_size = args.split_eval_size
+    #    if split_eval_size >= 1:
+    #        split_eval_size = int(split_eval_size)
+    #    # ラベル付きデータを訓練用と評価用に分割
+    #    # ページ単位で分割することが好ましいので、ウィンドウ化よりも前に行う必要あり
+    #    dataset = dataset['train'].train_test_split(
+    #        test_size=split_eval_size,
+    #        seed=args.seed
+    #    )
+    #    logger.debug('dataset: %s', dataset)
+    ##logger.debug('dataset test page_id: %s', dataset['test']['page_id'])
 
     # 通常、512トークンを超える系列の処理はそのままできないため、
     # スライドウィンドウを用いて分割する
     # (データセットのチャンク分割はバッチ処理でのみ可能)
-    def split_into_windows(example):
-        windows = []
-        tokens = example['tokens']
-        tags = example['tags']
-        for window_id, i in enumerate(
-            range(0, len(tokens), args.window_size - args.window_overlap_size)
-        ):
-            window_tokens = tokens[i:i+args.window_size]
-            #window_tags = [tag_list[i:i+args.window_size] for tag_list in tags]
-            window_tags = [
-                tag_list[i:i+args.window_size] if tag_list is not None
-                else None
-                for tag_list in tags
-            ]
-            window = {}
-            window['page_id'] = example['page_id']
-            window['title'] = example['title']
-            window['category_name'] = example['category_name']
-            window['ENE'] = example['ENE']
-            window['window_id'] = window_id
-            window['tokens'] = window_tokens
-            window['tags'] = window_tags
-            windows.append(window)
-        return windows
+    #def split_into_windows(example):
+    #    windows = []
+    #    tokens = example['tokens']
+    #    tags = example['tags']
+    #    for window_id, i in enumerate(
+    #        range(0, len(tokens), args.window_size - args.window_overlap_size)
+    #    ):
+    #        window_tokens = tokens[i:i+args.window_size]
+    #        #window_tags = [tag_list[i:i+args.window_size] for tag_list in tags]
+    #        window_tags = [
+    #            tag_list[i:i+args.window_size] if tag_list is not None
+    #            else None
+    #            for tag_list in tags
+    #        ]
+    #        window = {}
+    #        window['page_id'] = example['page_id']
+    #        window['title'] = example['title']
+    #        window['category_name'] = example['category_name']
+    #        window['ENE'] = example['ENE']
+    #        window['window_id'] = window_id
+    #        window['tokens'] = window_tokens
+    #        window['tags'] = window_tags
+    #        windows.append(window)
+    #    return windows
     
-    dataset = dataset.map(
-        #split_into_windows,
-        convert_example_mapper_to_batch_mapper(split_into_windows, [
-            'page_id',
-            'title',
-            'category_name',
-            'ENE',
-            'tokens',
-            'tags',
-            'tokens',
-        ]),
-        desc='Splitting into slide windows',
-        batched=True,
-        remove_columns=dataset['train'].column_names,
-        batch_size=10,
-        writer_batch_size=10,
-        num_proc=args.num_workers,
-    )
-    logger.debug('dataset: %s', dataset)
+    #dataset = dataset.map(
+    #    #split_into_windows,
+    #    convert_example_mapper_to_batch_mapper(split_into_windows, [
+    #        'page_id',
+    #        'title',
+    #        'category_name',
+    #        'ENE',
+    #        'tokens',
+    #        'tags',
+    #        'tokens',
+    #    ]),
+    #    desc='Splitting into slide windows',
+    #    batched=True,
+    #    remove_columns=dataset['train'].column_names,
+    #    batch_size=10,
+    #    writer_batch_size=10,
+    #    num_proc=args.num_workers,
+    #)
+    #logger.debug('dataset: %s', dataset)
 
-    tag_list = ['O', 'B', 'I']
-    map_tag_to_id = {tag: i for i, tag in enumerate(tag_list)}
-    num_labels = len(tag_list)
+    #tag_list = ['O', 'B', 'I']
+    #map_tag_to_id = {tag: i for i, tag in enumerate(tag_list)}
+    #num_labels = len(tag_list)
+
+    ##logger.debug('attribute_names: %s', attribute_names)
+    ## トークン ID とタグ ID の付与
+    #def prepare_ids(example):
+    #    token_ids = tokenizer.encode(example['tokens'])
+    #    # 先頭 (CLS), 末尾 (SEP) はタグの予測不要
+    #    # BIO以外の文字(空白)はタグの予測不要
+    #    tag_ids = [
+    #        [-100] + [map_tag_to_id.get(char, -100) for char in tag_str] + [-100]
+    #        if tag_str is not None
+    #        else None
+    #        for tag_str in example['tags']
+    #    ]
+    #    return {
+    #        'input_ids': token_ids,
+    #        'tag_ids': tag_ids,
+    #    }
+    #dataset = dataset.map(
+    #    #prepare_ids,
+    #    convert_example_mapper_to_batch_mapper(prepare_ids, [
+    #        'tokens',
+    #        'tags',
+    #    ]),
+    #    batched=True,
+    #    desc='Converting tokens and tags into ids',
+    #    batch_size=10,
+    #    writer_batch_size=10,
+    #    num_proc=args.num_workers,
+    #)
+    #logger.debug('dataset: %s', dataset)
+    ##logger.debug('dataset["train"][0]: %s', dataset['train'][0])
+
+    num_attribute_names = len(preprocess_result.attribute_names)
+    tag_list = preprocess_result.tag_list
 
     config = AutoConfig.from_pretrained(
         args.model_name_or_path,
-        num_labels=num_labels,
+        #num_labels=num_labels,
+        num_labels=len(tag_list)
+        #num_labels=len(preprocess_result.tag_list),
     )
 
     model = TokenMultiClassificationModel(
         pretrained_model_name_or_path=args.model_name_or_path,
         config=config,
         num_attribute_names = num_attribute_names,
+        #num_attribute_names = len(preprocess_result.attribute_names),
     )
     logger.debug('model: %s', model)
 
-    model.config.label2id = map_tag_to_id
-    model.config.id2label = tag_list
+    #model.config.label2id = map_tag_to_id
+    #model.config.id2label = tag_list
+    model.config.id2label = preprocess_result.tag_list
+    model.config.label2id = preprocess_result.map_tag_to_id
 
     logger.debug('new model.config: %s', model.config)
-
-    #logger.debug('attribute_names: %s', attribute_names)
-    # トークン ID とタグ ID の付与
-    def prepare_ids(example):
-        token_ids = tokenizer.encode(example['tokens'])
-        # 先頭 (CLS), 末尾 (SEP) はタグの予測不要
-        # BIO以外の文字(空白)はタグの予測不要
-        tag_ids = [
-            [-100] + [map_tag_to_id.get(char, -100) for char in tag_str] + [-100]
-            if tag_str is not None
-            else None
-            for tag_str in example['tags']
-        ]
-        return {
-            'input_ids': token_ids,
-            'tag_ids': tag_ids,
-        }
-    dataset = dataset.map(
-        #prepare_ids,
-        convert_example_mapper_to_batch_mapper(prepare_ids, [
-            'tokens',
-            'tags',
-        ]),
-        batched=True,
-        desc='Converting tokens and tags into ids',
-        batch_size=10,
-        writer_batch_size=10,
-        num_proc=args.num_workers,
-    )
-    logger.debug('dataset: %s', dataset)
-    #logger.debug('dataset["train"][0]: %s', dataset['train'][0])
 
     train_dataset = dataset['train']
     eval_dataset = dataset['test']
 
-    map_page_id_to_information = {}
-    def record_information(example):
-        keys = [
-            'page_id',
-            'title',
-            'category_name',
-            'ENE',
-        ]
-        page_id = example['page_id']
-        info = {
-            key: example[key] for key in keys
-        }
-        map_page_id_to_information[page_id] = info
-    raw_dataset.map(
-        record_information,
-        desc='Recording page information',
-    )
+    #map_page_id_to_information = {}
+    #def record_information(example):
+    #    keys = [
+    #        'page_id',
+    #        'title',
+    #        'category_name',
+    #        'ENE',
+    #    ]
+    #    page_id = example['page_id']
+    #    info = {
+    #        key: example[key] for key in keys
+    #    }
+    #    map_page_id_to_information[page_id] = info
+    #raw_dataset.map(
+    #    record_information,
+    #    desc='Recording page information',
+    #)
 
     #resuming = False
     skip_collation = False
@@ -883,33 +856,10 @@ def main():
                 "accuracy": results["overall_accuracy"],
             }
         
-    # Train!
-    total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
-
-    logger.info("***** Running training *****")
-    logger.info("  Num examples = %d", len(train_dataset))
-    logger.info("  Num Epochs = %d", args.num_train_epochs)
-    logger.info("  Instantaneous batch size per device = %d", args.per_device_train_batch_size)
-    logger.info("  Total train batch size (w. parallel, distributed & accumulation) = %d", total_batch_size)
-    logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
-    logger.info("  Total optimization steps = %d", args.max_train_steps)
-    # Only show the progress bar once on each machine.
-    progress_bar = tqdm(
-        range(args.max_train_steps), disable=not accelerator.is_local_main_process
-    )
-    completed_steps = 0
-    starting_epoch = 0
-    # Potentially load in the weights and states from a previous save
-    resume_path = None
-
     if args.resume_from_checkpoint:
-    #if args.resume_from_checkpoint is not None or args.resume_from_checkpoint != "":
-    #if args.resume_from_checkpoint is not None and args.resume_from_checkpoint != "":
         accelerator.print(f"Resumed from checkpoint {args.resume_from_checkpoint}")
         accelerator.load_state(args.resume_from_checkpoint)
-        #path = os.path.basename(args.resume_from_checkpoint)
         resume_path = os.path.basename(args.resume_from_checkpoint)
-        #resuming = True
     else:
         # Get the most recent checkpoint
         dirs = [
@@ -931,38 +881,6 @@ def main():
             accelerator.load_state(resume_path)
             #resuming = True
     logger.debug('resume_path: %s', resume_path)
-
-    starting_epoch = 0
-    resume_step = -1
-    eval_metric = None
-
-    status_path = os.path.join(args.output_dir, "status.json")
-    status = {}
-    if resume_path:
-        with open(os.path.join(resume_path, 'status.json'), "r", encoding='utf-8') as f:
-            status = json.load(f)
-            logger.debug('Loaded status: %s', status)
-            starting_epoch = status['last_epoch']
-            resume_step = status['last_step']
-            resume_step -= starting_epoch * len(train_dataloader)
-    elif os.path.isfile(status_path):
-        with open(status_path, "r", encoding='utf-8') as f:
-            status = json.load(f)
-            logger.debug('Loaded status: %s', status)
-
-    # Extract `epoch_{i}` or `step_{i}`
-    #if resume_path:
-    #    training_difference = os.path.splitext(resume_path)[0]
-    #    logger.debug('training_difference: %s', training_difference)
-
-    #    if "epoch_" in training_difference and "_step_" in training_difference:
-    #        resume_step = int(training_difference.split("_")[-1])
-    #        starting_epoch = resume_step // len(train_dataloader)
-    #        resume_step -= starting_epoch * len(train_dataloader)
-    #    else:
-    #        raise ValueError(f'Failed to parse training_difference: {training_difference}')
-    logger.debug('starting_epoch: %d', starting_epoch)
-    logger.debug('resume_step: %d', resume_step)
 
     def save_best_status(eval_metric):
         status['last_epoch'] = epoch
@@ -1024,9 +942,10 @@ def main():
         eval_metric = compute_metrics()
         logger.debug('Finished computing metrics')
         #accelerator.print(f"epoch {epoch}:", eval_metric)
-        if accelerator.is_main_process:
-            logger.info(f'epoch {epoch} eval_metric: {eval_metric}')
-        save_best_status(eval_metric)
+        if args.do_train:
+            if accelerator.is_main_process:
+                logger.info(f'epoch {epoch} eval_metric: {eval_metric}')
+            save_best_status(eval_metric)
         return eval_metric
 
     def do_save(output_dir):
@@ -1039,133 +958,193 @@ def main():
             with open(status_path, "w", encoding='utf-8') as f:
                 json.dump(status, f, indent=2, sort_keys=True, ensure_ascii=False)
 
-    #for epoch in range(starting_epoch, args.num_train_epochs):
-    for epoch in range(0, args.num_train_epochs):
-        # 学習済みのステップはスキップ
-        if epoch < starting_epoch:
-            completed_steps += len(train_dataloader)
-            progress_bar.update(len(train_dataloader))
-            #if epoch + 1 == starting_epoch:
-            #    resuming = False
-            #if epoch + args.num_workers >= starting_epoch:
-            #    skip_collation = False
-            #else:
-            #    skip_collation = True
-            continue
+    if args.do_train:
+        # Train!
+        total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
-        total_loss = 0
-        #fed_samples = 0
-        fed_iterations = 0
-        zero_filled_epoch = str(epoch).zfill(len(str(args.num_train_epochs - 1)))
-        for step, batch in enumerate(train_dataloader):
-            if starting_epoch == epoch:
-                if step <= resume_step:
-                    completed_steps += 1
+        logger.info("***** Running training *****")
+        logger.info("  Num examples = %d", len(train_dataset))
+        logger.info("  Num Epochs = %d", args.num_train_epochs)
+        logger.info("  Instantaneous batch size per device = %d", args.per_device_train_batch_size)
+        logger.info("  Total train batch size (w. parallel, distributed & accumulation) = %d", total_batch_size)
+        logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
+        logger.info("  Total optimization steps = %d", args.max_train_steps)
+        # Only show the progress bar once on each machine.
+        progress_bar = tqdm(
+            range(args.max_train_steps), disable=not accelerator.is_local_main_process
+        )
+        completed_steps = 0
+        starting_epoch = 0
+        # Potentially load in the weights and states from a previous save
+        resume_path = None
+
+        starting_epoch = 0
+        resume_step = -1
+        eval_metric = None
+
+        status_path = os.path.join(args.output_dir, "status.json")
+        status = {}
+        if resume_path:
+            with open(os.path.join(resume_path, 'status.json'), "r", encoding='utf-8') as f:
+                status = json.load(f)
+                logger.debug('Loaded status: %s', status)
+                starting_epoch = status['last_epoch']
+                resume_step = status['last_step']
+                resume_step -= starting_epoch * len(train_dataloader)
+        elif os.path.isfile(status_path):
+            with open(status_path, "r", encoding='utf-8') as f:
+                status = json.load(f)
+                logger.debug('Loaded status: %s', status)
+
+        # Extract `epoch_{i}` or `step_{i}`
+        #if resume_path:
+        #    training_difference = os.path.splitext(resume_path)[0]
+        #    logger.debug('training_difference: %s', training_difference)
+
+        #    if "epoch_" in training_difference and "_step_" in training_difference:
+        #        resume_step = int(training_difference.split("_")[-1])
+        #        starting_epoch = resume_step // len(train_dataloader)
+        #        resume_step -= starting_epoch * len(train_dataloader)
+        #    else:
+        #        raise ValueError(f'Failed to parse training_difference: {training_difference}')
+        logger.debug('starting_epoch: %d', starting_epoch)
+        logger.debug('resume_step: %d', resume_step)
+
+        
+        #for epoch in range(starting_epoch, args.num_train_epochs):
+        for epoch in range(0, args.num_train_epochs):
+            # 学習済みのステップはスキップ
+            if epoch < starting_epoch:
+                completed_steps += len(train_dataloader)
+                progress_bar.update(len(train_dataloader))
+                #if epoch + 1 == starting_epoch:
+                #    resuming = False
+                #if epoch + args.num_workers >= starting_epoch:
+                #    skip_collation = False
+                #else:
+                #    skip_collation = True
+                continue
+
+            total_loss = 0
+            #fed_samples = 0
+            fed_iterations = 0
+            zero_filled_epoch = str(epoch).zfill(len(str(args.num_train_epochs - 1)))
+            for step, batch in enumerate(train_dataloader):
+                if starting_epoch == epoch:
+                    if step <= resume_step:
+                        completed_steps += 1
+                        progress_bar.update(1)
+                        #if step == resume_step:
+                        #    resuming = False
+                        if step + args.num_workers >= resume_step:
+                            skip_collation = False
+                        else:
+                            skip_collation = True
+                        continue
+                resuming = False
+                model.train()
+                #outputs = model(**batch)
+                outputs = model(
+                    input_ids = batch['input_ids'],
+                    tag_ids = batch['tag_ids'],
+                    attention_mask = batch.get('attention_mask'),
+                    token_type_ids = batch.get('token_type_ids'),
+                )
+                loss = outputs.loss
+                # We keep track of the loss at each epoch
+                total_loss += loss.detach().float()
+                loss = loss / args.gradient_accumulation_steps
+                #fed_samples += len(batch["input_ids"])
+                fed_iterations += 1
+                accelerator.backward(loss)
+                if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad()
                     progress_bar.update(1)
-                    #if step == resume_step:
-                    #    resuming = False
-                    if step + args.num_workers >= resume_step:
-                        skip_collation = False
-                    else:
-                        skip_collation = True
-                    continue
-            resuming = False
-            model.train()
-            #outputs = model(**batch)
-            outputs = model(
-                input_ids = batch['input_ids'],
-                tag_ids = batch['tag_ids'],
-                attention_mask = batch.get('attention_mask'),
-                token_type_ids = batch.get('token_type_ids'),
-            )
-            loss = outputs.loss
-            # We keep track of the loss at each epoch
-            total_loss += loss.detach().float()
-            loss = loss / args.gradient_accumulation_steps
-            #fed_samples += len(batch["input_ids"])
-            fed_iterations += 1
-            accelerator.backward(loss)
-            if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
-                progress_bar.update(1)
-                completed_steps += 1
+                    completed_steps += 1
 
-            if isinstance(checkpointing_steps, int):
-                if completed_steps % checkpointing_steps == 0:
-                    zero_filled_step = str(completed_steps).zfill(len(str(args.max_train_steps - 1)))
-                    #output_dir = f"step_{completed_steps}"
-                    #output_dir = f"epoch_{zero_filled_epoch}_step_{completed_steps}"
-                    output_dir = f"epoch_{zero_filled_epoch}_step_{zero_filled_step}"
-                    #if args.output_dir is not None:
-                    #    output_dir = os.path.join(args.output_dir, output_dir)
-                    #accelerator.save_state(output_dir)
-                    do_save(output_dir)
-                    if total_loss > 0:
-                        train_log = {
-                            #"train_loss": total_loss.item() / len(train_dataloader),
-                            "train_loss": total_loss.item() / fed_iterations,
-                            "epoch": epoch,
-                            "step": completed_steps,
-                        }
-                        if accelerator.is_main_process:
-                            logger.info(f'epoch {epoch} train_log: {train_log}')
-                    eval_metric = do_eval()
+                if isinstance(checkpointing_steps, int):
+                    if completed_steps % checkpointing_steps == 0:
+                        zero_filled_step = str(completed_steps).zfill(len(str(args.max_train_steps - 1)))
+                        #output_dir = f"step_{completed_steps}"
+                        #output_dir = f"epoch_{zero_filled_epoch}_step_{completed_steps}"
+                        output_dir = f"epoch_{zero_filled_epoch}_step_{zero_filled_step}"
+                        #if args.output_dir is not None:
+                        #    output_dir = os.path.join(args.output_dir, output_dir)
+                        #accelerator.save_state(output_dir)
+                        do_save(output_dir)
+                        if total_loss > 0:
+                            train_log = {
+                                #"train_loss": total_loss.item() / len(train_dataloader),
+                                "train_loss": total_loss.item() / fed_iterations,
+                                "epoch": epoch,
+                                "step": completed_steps,
+                            }
+                            if accelerator.is_main_process:
+                                logger.info(f'epoch {epoch} train_log: {train_log}')
+                        eval_metric = do_eval()
 
-            if completed_steps >= args.max_train_steps:
-                break
+                if completed_steps >= args.max_train_steps:
+                    break
 
-        if total_loss > 0:
-            train_log = {
-                #"train_loss": total_loss.item() / len(train_dataloader),
-                "train_loss": total_loss.item() / fed_iterations,
-                "epoch": epoch,
-                "step": completed_steps,
-            }
-            if accelerator.is_main_process:
-            #accelerator.print(f'epoch {epoch}:', train_log)
-                logger.info(f'epoch {epoch} train_log: {train_log}')
-        eval_metric = do_eval()
+            if total_loss > 0:
+                train_log = {
+                    #"train_loss": total_loss.item() / len(train_dataloader),
+                    "train_loss": total_loss.item() / fed_iterations,
+                    "epoch": epoch,
+                    "step": completed_steps,
+                }
+                if accelerator.is_main_process:
+                #accelerator.print(f'epoch {epoch}:', train_log)
+                    logger.info(f'epoch {epoch} train_log: {train_log}')
+            eval_metric = do_eval()
+            if args.with_tracking:
+                train_log['seqeval'] = eval_metric
+                accelerator.log(
+                    train_log,
+                    step=completed_steps,
+                )
+
+            # 各エポック毎のモデルは毎回保存
+            #output_dir = f"epoch_{epoch}"
+                zero_filled_step = str(completed_steps).zfill(len(str(args.max_train_steps - 1)))
+            output_dir = f"epoch_{zero_filled_epoch}_step_{zero_filled_step}"
+            #if args.output_dir is not None:
+            #    output_dir = os.path.join(args.output_dir, output_dir)
+            #accelerator.save_state(output_dir)
+            do_save(output_dir)
+
         if args.with_tracking:
-            train_log['seqeval'] = eval_metric
-            accelerator.log(
-                train_log,
-                step=completed_steps,
-            )
+            accelerator.end_training()
 
-        # 各エポック毎のモデルは毎回保存
-        #output_dir = f"epoch_{epoch}"
-            zero_filled_step = str(completed_steps).zfill(len(str(args.max_train_steps - 1)))
-        output_dir = f"epoch_{zero_filled_epoch}_step_{zero_filled_step}"
-        #if args.output_dir is not None:
-        #    output_dir = os.path.join(args.output_dir, output_dir)
-        #accelerator.save_state(output_dir)
-        do_save(output_dir)
+        if args.output_dir is not None:
+            if eval_metric is not None:
+                accelerator.wait_for_everyone()
+                unwrapped_model = accelerator.unwrap_model(model)
+                unwrapped_model.save_pretrained(
+                    args.output_dir,
+                    is_main_process=accelerator.is_main_process,
+                    save_function=accelerator.save,
+                )
+                if accelerator.is_main_process:
+                    tokenizer.save_pretrained(args.output_dir)
 
-    if args.with_tracking:
-        accelerator.end_training()
+                    all_results = {f"eval_{k}": v for k, v in eval_metric.items()}
+                    if args.with_tracking:
+                        all_results.update({"train_loss": total_loss.item() / len(train_dataloader)})
+                    all_results_path = os.path.join(args.output_dir, "all_results.json")
+                    with open(all_results_path, "w", encoding="utf-8") as f:
+                        json.dump(all_results, f)
+                    with open(status_path, "w", encoding="utf-8") as f:
+                        json.dump(status, f, ensure_ascii=False, sort_keys=True, indent=2)
 
-    if args.output_dir is not None:
-        if eval_metric is not None:
-            accelerator.wait_for_everyone()
-            unwrapped_model = accelerator.unwrap_model(model)
-            unwrapped_model.save_pretrained(
-                args.output_dir,
-                is_main_process=accelerator.is_main_process,
-                save_function=accelerator.save,
-            )
-            if accelerator.is_main_process:
-                tokenizer.save_pretrained(args.output_dir)
-
-                all_results = {f"eval_{k}": v for k, v in eval_metric.items()}
-                if args.with_tracking:
-                    all_results.update({"train_loss": total_loss.item() / len(train_dataloader)})
-                all_results_path = os.path.join(args.output_dir, "all_results.json")
-                with open(all_results_path, "w", encoding="utf-8") as f:
-                    json.dump(all_results, f)
-                with open(status_path, "w", encoding="utf-8") as f:
-                    json.dump(status, f, ensure_ascii=False, sort_keys=True, indent=2)
+    if not args.do_train and args.do_eval:
+        logger.info("***** Running evaluation *****")
+        logger.info("  Num examples = %d", len(eval_dataset))
+        logger.info("  Instantaneous batch size per device = %d", args.per_device_eval_batch_size)
+        eval_metric = do_eval()
+        logger.info(f'eval_metric: {eval_metric}')
 
 if __name__ == '__main__':
     main()
