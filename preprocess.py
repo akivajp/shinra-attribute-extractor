@@ -3,6 +3,7 @@
 '''
 
 import dataclasses
+import os
 
 from typing import (
     Any,
@@ -15,7 +16,10 @@ from typing import (
 
 from logzero import logger
 
-from datasets import Dataset
+from datasets import (
+    Dataset,
+    load_dataset,
+)    
 from transformers import PreTrainedTokenizer
 
 from html_cleaning import clean_up_html
@@ -23,17 +27,32 @@ from tokenization import tokenize_with_offsets
 from tagging import tag_tokens_with_annotation_list
 
 @dataclasses.dataclass
+class LabelIdMapping:
+    '''
+    ラベル文字列とIDのマッピング
+    '''
+    attribute_names: List[str]
+    map_attribute_name_to_id: Dict[str, int]
+    map_ene_to_attribute_name_counter: Dict[str, Dict[str, int]]
+    map_ene_to_attribute_id_counter: Dict[str, Dict[int, int]]
+    tag_list: List[str]
+    map_tag_to_id: Dict[str, int]
+    map_page_id_to_information: Dict[str, Dict[str, Any]]
+
+@dataclasses.dataclass
 class PreprocessResult:
     '''
     前処理結果
     '''
     dataset: Dataset
-    attribute_names: List[str]
-    map_attribute_name_to_id: Dict[str, int]
-    map_ene_to_attribute_name_counter: Dict[str, Dict[str, int]]
-    tag_list: List[str]
-    map_tag_to_id: Dict[str, int]
-    map_page_id_to_information: Dict[str, Dict[str, Any]]
+    #attribute_names: List[str]
+    #map_attribute_name_to_id: Dict[str, int]
+    #map_ene_to_attribute_name_counter: Dict[str, Dict[str, int]]
+    #tag_list: List[str]
+    #map_tag_to_id: Dict[str, int]
+    #map_page_id_to_information: Dict[str, Dict[str, Any]]
+    mapping: LabelIdMapping
+
 
 def slice_batch_from_keys(
     batch: Mapping[str, Iterable],
@@ -90,6 +109,27 @@ def convert_example_mapper_to_batch_mapper(
         return map_key_to_list_features
     return batch_mapper
 
+# HTML をクリーニング
+# 属性値抽出の対象とならないであろう箇所を除去
+# HTMLタグは一般的なサブワード分割と相性が悪く
+# 無駄にトークン数が増えてしまうのは防ぎたい
+def clean_context_html(example):
+    cleaned_html = clean_up_html(example['context_html'])
+    return {'context_html': cleaned_html}
+
+# トークン化のみ
+def tokenize(
+    tokenizer: PreTrainedTokenizer,
+):
+    def _tokenize(example):
+        tokens_with_offsets = tokenize_with_offsets(tokenizer, example['context_html'])
+        tokens = [token.text for token in tokens_with_offsets]
+        return {
+            'tokens': tokens,
+            'tokens_with_offsets': [dataclasses.asdict(t) for t in tokens_with_offsets],
+        }
+    return _tokenize
+
 # トークン化と IOB2 タグの付与
 #def tokenize_and_tag(example):
 def tokenize_and_tag(
@@ -142,25 +182,34 @@ def split_into_windows(
     def _split_into_windows(example):
         windows = []
         tokens = example['tokens']
-        tags = example['tags']
+        if 'tags' in example:
+            tags = example['tags']
+        else:
+            tags = None
         for window_id, i in enumerate(
             range(0, len(tokens), window_size - window_overlap_size)
         ):
             window_tokens = tokens[i : i+window_size]
             #window_tags = [tag_list[i:i+args.window_size] for tag_list in tags]
-            window_tags = [
-                tag_list[i : i+window_size] if tag_list is not None
-                else None
-                for tag_list in tags
-            ]
+            if tags is not None:
+                window_tags = [
+                    tag_list[i : i+window_size] if tag_list is not None
+                    else None
+                    for tag_list in tags
+                ]
+            if 'tokens_with_offsets' in example:
+                window_tokens_with_offsets = example['tokens_with_offsets'][i : i+window_size]
             window = {}
             window['page_id'] = example['page_id']
             window['title'] = example['title']
-            window['category_name'] = example['category_name']
+            #window['category_name'] = example['category_name']
             window['ENE'] = example['ENE']
             window['window_id'] = window_id
             window['tokens'] = window_tokens
-            window['tags'] = window_tags
+            if tags is not None:
+                window['tags'] = window_tags
+            if 'tokens_with_offsets' in example:
+                window['tokens_with_offsets'] = window_tokens_with_offsets
             windows.append(window)
         return windows
     return _split_into_windows
@@ -174,6 +223,10 @@ def prepare_ids(
 ):
     def _prepare_ids(example):
         token_ids = tokenizer.encode(example['tokens'])
+        if 'tags' not in example:
+            return {
+                'input_ids': token_ids,
+            }
         # 先頭 (CLS), 末尾 (SEP) はタグの予測不要
         # BIO以外の文字(空白)はタグの予測不要
         tag_ids = [
@@ -188,7 +241,7 @@ def prepare_ids(
         }
     return _prepare_ids
 
-def preprocess_dataset(
+def preprocess_for_training(
     raw_dataset: Dataset,
     tokenizer: PreTrainedTokenizer,
     target_categories = None,
@@ -205,7 +258,6 @@ def preprocess_dataset(
     dataset = dataset.remove_columns(['context_text', 'attributes.text_offset'])
     
     # --target_categories が与えられた場合は、そのカテゴリのみで絞り込む
-    target_categories = None
     if target_categories is not None:
         target_categories = target_categories.split(',')
         logger.debug('target_categories: %s', target_categories)
@@ -230,27 +282,27 @@ def preprocess_dataset(
         ene = example['ENE']
         for attribute_name in example['attributes.attribute']:
             set_attribute_names.add(attribute_name)
-            # NOTE: setの代わりにdictを使う必要あり(前述の理由)
-            # if ene not in map_ene_to_attribute_name_set:
-            #     map_ene_to_attribute_name_set[ene] = set()
-            # map_ene_to_attribute_name_set[ene].add(attribute_name)
+            ## NOTE: setの代わりにdictを使う必要あり(前述の理由)
+            #if ene not in map_ene_to_attribute_name_set:
+            #    map_ene_to_attribute_name_set[ene] = set()
+            #map_ene_to_attribute_name_set[ene].add(attribute_name)
             if ene not in map_ene_to_attribute_name_counter:
                 map_ene_to_attribute_name_counter[ene] = {}
             count = map_ene_to_attribute_name_counter[ene].get(attribute_name, 0)
             map_ene_to_attribute_name_counter[ene][attribute_name] = count + 1
+    # 属性名のリスト
     attribute_names = sorted(set_attribute_names)
     #mappers = Mappers()
+    # 属性名から属性IDへのマッピング
     map_attribute_name_to_id = {name: i for i, name in enumerate(attribute_names)}
-    num_attribute_names = len(attribute_names)
+    #num_attribute_names = len(attribute_names)
     #logger.debug('attribute_names: %s', attribute_names)
+    # ENEから属性IDカウントへのマッピング
+    map_ene_to_attribute_id_counter = {
+        ene: { map_attribute_name_to_id[name]: count for name, count in counter.items() }
+        for ene, counter in map_ene_to_attribute_name_counter.items()
+    }
 
-    # HTML をクリーニング
-    # 属性値抽出の対象とならないであろう箇所を除去
-    # HTMLタグは一般的なサブワード分割と相性が悪く
-    # 無駄にトークン数が増えてしまうのは防ぎたい
-    def clean_context_html(example):
-        cleaned_html = clean_up_html(example['context_html'])
-        return {'context_html': cleaned_html}
     # デフォルトの batch_size=1000 だと処理1回の負荷が大きすぎる
     dataset = dataset.map(
         convert_example_mapper_to_batch_mapper(clean_context_html, ['context_html']),
@@ -266,7 +318,6 @@ def preprocess_dataset(
     # 1サンプルのサイズが大きい場合に結合に失敗することがあるので制限する必要がある
     # writer_batch_size=100, batch_size=100 でもちょっと怪しい
     dataset = dataset.map(
-        #tokenize_and_tag,
         convert_example_mapper_to_batch_mapper(
             tokenize_and_tag(
                 tokenizer,
@@ -284,7 +335,6 @@ def preprocess_dataset(
         desc='Tokenizing and tagging',
         batch_size=10,
         writer_batch_size=10,
-        #num_proc=args.num_workers,
         num_proc=num_workers,
     )
     #logger.debug('dataset: %s', dataset)
@@ -310,11 +360,10 @@ def preprocess_dataset(
             ), [
                 'page_id',
                 'title',
-                'category_name',
+                #'category_name',
                 'ENE',
                 'tokens',
                 'tags',
-                'tokens',
             ]
         ),
         desc='Splitting into slide windows',
@@ -328,7 +377,7 @@ def preprocess_dataset(
 
     tag_list = ['O', 'B', 'I']
     map_tag_to_id = {tag: i for i, tag in enumerate(tag_list)}
-    num_labels = len(tag_list)
+    #num_labels = len(tag_list)
 
     dataset = dataset.map(
         #prepare_ids,
@@ -356,7 +405,7 @@ def preprocess_dataset(
         keys = [
             'page_id',
             'title',
-            'category_name',
+            #'category_name',
             'ENE',
         ]
         page_id = example['page_id']
@@ -370,12 +419,192 @@ def preprocess_dataset(
     )
 
     #return dataset
+    #return PreprocessResult(
+    #    dataset,
+    #    attribute_names,
+    #    map_attribute_name_to_id,
+    #    map_ene_to_attribute_name_counter,
+    #    tag_list,
+    #    map_tag_to_id,
+    #    map_page_id_to_information,
+    #)
     return PreprocessResult(
         dataset,
-        attribute_names,
-        map_attribute_name_to_id,
-        map_ene_to_attribute_name_counter,
-        tag_list,
-        map_tag_to_id,
-        map_page_id_to_information,
+        LabelIdMapping(
+            attribute_names,
+            map_attribute_name_to_id,
+            map_ene_to_attribute_name_counter,
+            map_ene_to_attribute_id_counter,
+            tag_list,
+            map_tag_to_id,
+            map_page_id_to_information,
+        )
     )
+
+def convert_ene_predicts_to_ene_list(example):
+    #logger.debug('example: %s', example)
+    ene_preds = example['ENEs']
+    pred_dict = {}
+    #logger.debug('ene_preds: %s', ene_preds)
+    for system_name, preds in ene_preds.items():
+        for pred in preds:
+            #flat_preds.append({ pred['ENE']: pred['prob'] })
+            ene = pred['ENE']
+            prob = pred['prob']
+            if ene not in pred_dict or prob > pred_dict[ene]:
+                pred_dict[ene] = prob
+    #logger.debug('pred_dict: %s', pred_dict)
+    # 確率50%以上のものだけを抽出
+    filtered_dict = { ene: prob for ene, prob in pred_dict.items() if prob >= 0.5 }
+    #logger.debug('filtered_dict: %s', filtered_dict)
+    if len(filtered_dict) > 1:
+        pred_dict = filtered_dict
+    return {'ENEs': [ene for ene, prob in pred_dict.items()]}
+
+def filter_by_ene(map_ene_to_attribute_name_counter):
+    def _filter_by_ene(example):
+        ene = example['ENE']
+        if ene in map_ene_to_attribute_name_counter:
+            return True
+        return False
+    return _filter_by_ene
+
+def load_context_html(input_html_dir):
+    def _load_context_html(example):
+        html_path = os.path.join(input_html_dir, example['page_id'] + '.html')
+        with open(html_path, 'r', encoding='utf-8') as f:
+            html = f.read()
+        return {'context_html': html}
+    return _load_context_html
+
+def split_into_individual_enes(example):
+    splitted_examples = []
+    for ene in example['ENEs']:
+        splitted_examples.append({
+            'page_id': example['page_id'],
+            'title': example['title'],
+            'ENE': ene,
+        })
+    return splitted_examples
+
+def prepare_for_prediction(
+    input_jsonl_path,
+    input_html_dir,
+    mapping: LabelIdMapping,
+    tokenizer: PreTrainedTokenizer,
+    num_workers = None,
+    window_size = 510,
+    window_overlap_size = 128,
+):
+    logger.debug('loading from %s', input_jsonl_path)
+    dataset = load_dataset('json', data_files={'predict': input_jsonl_path})
+    dataset = dataset['predict']
+
+    dataset = dataset.map(
+        convert_example_mapper_to_batch_mapper(convert_ene_predicts_to_ene_list, [ 'ENEs' ]),
+        desc='Converting ENE predicts to ENE list',
+        batched=True,
+        num_proc=num_workers,
+    )
+    logger.debug('dataset: %s', dataset)
+
+    dataset = dataset.map(
+        convert_example_mapper_to_batch_mapper(
+            split_into_individual_enes,
+            [
+                'page_id',
+                'title',
+                'ENEs',
+            ]
+        ),
+        desc='Splitting into individual ENEs',
+        batched=True,
+        num_proc=num_workers,
+        remove_columns=dataset.column_names,
+    )
+    logger.debug('dataset: %s', dataset)
+
+    dataset = dataset.filter(
+        filter_by_ene(mapping.map_ene_to_attribute_name_counter),
+        desc='Filtering by ENE',
+    )
+
+    dataset = dataset.map(
+        convert_example_mapper_to_batch_mapper(load_context_html(input_html_dir), [ 'page_id' ]),
+        desc='Loading HTML files',
+        batched=True,
+        num_proc=num_workers,
+    )
+    logger.debug('dataset: %s', dataset)
+
+    dataset = dataset.map(
+        convert_example_mapper_to_batch_mapper(clean_context_html, ['context_html']),
+        batched=True,
+        desc='Cleaning HTML files',
+        batch_size=10,
+        writer_batch_size=10,
+        num_proc=num_workers,
+    )
+    logger.debug('dataset: %s', dataset)
+
+    dataset = dataset.map(
+        convert_example_mapper_to_batch_mapper(
+            tokenize(
+                tokenizer,
+            ),
+            [
+                'context_html',
+            ]
+        ),
+        batched=True,
+        desc='Tokenizing',
+        batch_size=10,
+        writer_batch_size=10,
+        num_proc=num_workers,
+    )
+    logger.debug('dataset: %s', dataset)
+
+    dataset = dataset.map(
+        convert_example_mapper_to_batch_mapper(
+            split_into_windows(
+                window_size,
+                window_overlap_size,
+            ), [
+                'page_id',
+                'title',
+                'ENE',
+                'tokens',
+                'tokens_with_offsets',
+            ]
+        ),
+        desc='Splitting into slide windows',
+        batched=True,
+        remove_columns=dataset.column_names,
+        batch_size=10,
+        writer_batch_size=10,
+        num_proc=num_workers,
+    )
+    logger.debug('dataset: %s', dataset)
+
+    #tag_list = mapping.tag_list
+    #map_tag_to_id = mapping.map_tag_to_id
+
+    dataset = dataset.map(
+        convert_example_mapper_to_batch_mapper(
+            prepare_ids(
+                tokenizer,
+                mapping.map_tag_to_id,
+            ),
+            [
+                'tokens',
+            ]
+        ),
+        batched=True,
+        desc='Converting tokens into ids',
+        batch_size=10,
+        writer_batch_size=10,
+        num_proc=num_workers,
+    )
+    logger.debug('dataset: %s', dataset)
+
+    return dataset

@@ -8,15 +8,7 @@ import os
 import re
 import sys
 
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    Iterable,
-    List,
-    Mapping,
-    Union,
-)
+from collections import OrderedDict
 
 import datasets
 from datasets import (
@@ -32,7 +24,7 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 
 from accelerate import Accelerator
-from accelerate.logging import get_logger
+#from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
@@ -49,18 +41,9 @@ from transformers import (
 import logzero
 from logzero import logger
 
-from tokenization import (
-    tokenize_with_offsets,
-)
-from tagging import (
-    tag_tokens_with_annotation_list,
-)
-from html_cleaning import (
-    clean_up_html,
-)
-
 from preprocess import (
-    preprocess_dataset,
+    preprocess_for_training,
+    prepare_for_prediction,
 )
 
 def parse_args():
@@ -84,12 +67,6 @@ def parse_args():
         action="store_true",
         help="Whether to run predictions on the test set.",
     )
-    #parser.add_argument(
-    #    "--dataset_name",
-    #    type=str,
-    #    default=None,
-    #    help="The name of the dataset to use (via the datasets library).",
-    #)
     #parser.add_argument(
     #    "--validation_file", type=str, default=None,
     #    help="A csv or a json file containing the validation data.",
@@ -130,16 +107,31 @@ def parse_args():
     #    help="Pretrained config name or path if not the same as model_name",
     #)
     parser.add_argument(
-        "--per_device_train_batch_size",
+        "--per_device_batch_size",
         type=int,
         default=8,
+        help="Common batch size (per device) for the training/evaluation/prediction.",
+    )
+    parser.add_argument(
+        "--per_device_train_batch_size",
+        type=int,
+        #default=8,
+        default=None,
         help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument(
         "--per_device_eval_batch_size",
         type=int,
-        default=8,
+        #default=8,
+        default=None,
         help="Batch size (per device) for the evaluation dataloader.",
+    )
+    parser.add_argument(
+        "--per_device_predict_batch_size",
+        type=int,
+        #default=8,
+        default=None,
+        help="Batch size (per device) for the prediction dataloader.",
     )
     parser.add_argument(
         "--learning_rate",
@@ -149,7 +141,9 @@ def parse_args():
     )
     parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay to use.")
     parser.add_argument(
-        "--num_train_epochs", type=int, default=3,
+        "--num_train_epochs", type=int,
+        #default=3,
+        default=10,
         help="Total number of training epochs to perform."
     )
     parser.add_argument(
@@ -258,13 +252,63 @@ def parse_args():
     parser.add_argument(
         "--num_workers",
         type=int,
-        default=1,
+        #default=1,
+        default=None,
         help=(
             "The number of workers to use for the dataset processing."
         ),
     )
 
+    parser.add_argument(
+        "--predict_input_jsonl",
+        type=str,
+        default=None,
+        help=(
+            "Path to the input jsonl file for prediction."
+        ),
+    )
+    parser.add_argument(
+        "--predict_html_dir",
+        type=str,
+        default=None,
+        help=(
+            "Path to the directory containing the html files for prediction."
+        ),
+    )
+    parser.add_argument(
+        "--predict_output_jsonl",
+        type=str,
+        default=None,
+        help=(
+            "Path to the output jsonl file for prediction."
+        ),
+    )
+
     args = parser.parse_args()
+
+    if args.do_predict:
+        if args.predict_input_jsonl is None:
+            raise ValueError(
+                "You must specify a `predict_input_jsonl` file for prediction."
+            )
+        if args.predict_html_dir is None:
+            raise ValueError(
+                "You must specify a `predict_html_dir` for prediction."
+            )
+        if args.predict_output_jsonl is None:
+            raise ValueError(
+                "You must specify a `predict_output_jsonl` file for prediction."
+            )
+        
+    if args.per_device_train_batch_size is None:
+        args.per_device_train_batch_size = args.per_device_batch_size
+    if args.per_device_eval_batch_size is None:
+        args.per_device_eval_batch_size = args.per_device_batch_size
+    if args.per_device_predict_batch_size is None:
+        args.per_device_predict_batch_size = args.per_device_batch_size
+
+    if args.num_workers is None:
+        args.num_workers = 2
 
     return args
 
@@ -273,7 +317,6 @@ class TokenMultiClassificationModel(transformers.PreTrainedModel):
     A multi-label classification model based on a pretrained transformer model.
     '''
     def __init__(self, config, pretrained_model_name_or_path, num_attribute_names):
-        logger.debug('__init__')
         super().__init__(config)
         self.config = config
         self.num_attribute_names = num_attribute_names
@@ -295,7 +338,7 @@ class TokenMultiClassificationModel(transformers.PreTrainedModel):
         )
 
         # Initialize weights and apply final processing
-        #self.post_init()
+        self.post_init()
 
     def forward(
         self,
@@ -364,7 +407,7 @@ def main():
         set_seed(args.seed)
 
     # Handle the repository creation
-    if accelerator.is_main_process:
+    if args.do_train and accelerator.is_main_process:
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
             logfile = os.path.join(args.output_dir, 'training.log')
@@ -378,8 +421,7 @@ def main():
         args.model_name_or_path,
     )
 
-    #dataset = preprocess_dataset(
-    preprocess_result = preprocess_dataset(
+    preprocess_result = preprocess_for_training(
         raw_dataset,
         tokenizer,
         target_categories = args.target_categories,
@@ -389,227 +431,28 @@ def main():
         window_size = args.window_size,
         window_overlap_size = args.window_overlap_size,
     )
-    #dataset = raw_dataset
     dataset = preprocess_result.dataset
+    mapping = preprocess_result.mapping
 
-    # 今回使わない特徴量は削除しておく
-    #dataset = dataset.flatten()
-    #dataset = dataset.remove_columns(['context_text', 'attributes.text_offset'])
+    if args.do_predict:
+        #with open(args.predict_input_jsonl, 'r', encoding='utf-8') as f:
+        #    predict_input = [json.loads(line) for line in f]
 
-    # --target_categories が与えられた場合は、そのカテゴリのみで絞り込む
-    #target_categories = None
-    #if args.target_categories is not None:
-    #    target_categories = args.target_categories.split(',')
-    #    logger.debug('target_categories: %s', target_categories)
-    #    dataset = dataset.filter(
-    #        lambda e: e['category_name'] in target_categories,
-    #        desc='Filtering with target categories',
-    #    )
-    #logger.debug('dataset: %s', dataset)
+        predict_dataset = prepare_for_prediction(
+            args.predict_input_jsonl,
+            args.predict_html_dir,
+            mapping,
+            tokenizer,
+            num_workers = args.num_workers,
+            window_size = args.window_size,
+            window_overlap_size = args.window_overlap_size,
+        )
+        logger.debug('predict_dataset: %s', predict_dataset)
 
-    ## 全属性名のリストと、
-    ## ENE に対応する属性名のリストの辞書を作成
-    #set_attribute_names = set()
-    ## NOTE: 超重要
-    ##   Dict[str,Set] で事足りることだけど、
-    ##   何故か Dataset.map()の適用関数内でsetオブジェクトに依存すると
-    ##   関数が同一視できなくなるらしくキャッシュロードできなくなるので(不具合?)
-    ##   計算量的に Dict[str,Dict] で代用する
-    ##   ついでに属性の出現回数でもカウントしておく
-    ##map_ene_to_attribute_name_set: dict[str,set] = {}
-    #map_ene_to_attribute_name_counter: dict[str,dict[str,int]] = {}
-    #for example in dataset['train']:
-    #    ene = example['ENE']
-    #    for attribute_name in example['attributes.attribute']:
-    #        set_attribute_names.add(attribute_name)
-    #        # NOTE: setの代わりにdictを使う必要あり(前述の理由)
-    #        # if ene not in map_ene_to_attribute_name_set:
-    #        #     map_ene_to_attribute_name_set[ene] = set()
-    #        # map_ene_to_attribute_name_set[ene].add(attribute_name)
-    #        if ene not in map_ene_to_attribute_name_counter:
-    #            map_ene_to_attribute_name_counter[ene] = {}
-    #        count = map_ene_to_attribute_name_counter[ene].get(attribute_name, 0)
-    #        map_ene_to_attribute_name_counter[ene][attribute_name] = count + 1
-    #attribute_names = sorted(set_attribute_names)
-    #map_attribute_name_to_id = {name: i for i, name in enumerate(attribute_names)}
-    #num_attribute_names = len(attribute_names)
-    ##logger.debug('attribute_names: %s', attribute_names)
+        #sys.exit(1)
 
-    ## HTML をクリーニング
-    ## 属性値抽出の対象とならないであろう箇所を除去
-    ## HTMLタグは一般的なサブワード分割と相性が悪く
-    ## 無駄にトークン数が増えてしまうのは防ぎたい
-    #def clean_context_html(example):
-    #    cleaned_html = clean_up_html(example['context_html'])
-    #    return {'context_html': cleaned_html}
-    ## デフォルトの batch_size=1000 だと処理1回の負荷が大きすぎる
-    #dataset = dataset.map(
-    #    #clean_context_html,
-    #    convert_example_mapper_to_batch_mapper(clean_context_html, ['context_html']),
-    #    batched=True,
-    #    desc='Cleaning HTML files',
-    #    #batch_size=1,
-    #    #batch_size=100,
-    #    #batch_size=10,
-    #    batch_size=10,
-    #    writer_batch_size=10,
-    #    num_proc=args.num_workers,
-    #)
-    #logger.debug('dataset: %s', dataset)
-
-    #tokenizer = AutoTokenizer.from_pretrained(
-    #    args.model_name_or_path,
-    #)
-
-    # トークン化と IOB2 タグの付与
-    #def tokenize_and_tag(example):
-    #    tokens_with_offsets = tokenize_with_offsets(tokenizer, example['context_html'])
-    #    tokens = [token.text for token in tokens_with_offsets]
-    #    tags, num_tagged, num_skipped = tag_tokens_with_annotation_list(
-    #        tokens_with_offsets,
-    #        [
-    #            {'attribute': attribute, 'html_offset': html_offset}
-    #            for attribute, html_offset in zip(
-    #                example['attributes.attribute'], example['attributes.html_offset']
-    #            )
-    #        ]
-    #    )
-    #    #extended_tags = [
-    #    #    ' ' * len(tokens)
-    #    #    for _ in range(len(attribute_names))
-    #    #]
-    #    extended_tags = [None] * num_attribute_names
-    #    ene = example['ENE']
-    #    attribute_name_counter = map_ene_to_attribute_name_counter[ene]
-    #    for attribute_name in attribute_name_counter:
-    #        attribute_id = map_attribute_name_to_id[attribute_name]
-    #        if attribute_name in tags:
-    #            extended_tags[attribute_id] = str.join('', tags[attribute_name])
-    #        else:
-    #            extended_tags[attribute_id] = 'O' * len(tokens)
-    #    #logger.debug('tags: %s', tags)
-    #    return {
-    #        'tokens': tokens,
-    #        'tags': extended_tags,
-    #    }
-    
-    # デフォルトの writer_batch_size は 1000 で、
-    # 1サンプルのサイズが大きい場合に結合に失敗することがあるので制限する必要がある
-    # writer_batch_size=100, batch_size=100 でもちょっと怪しい
-    #dataset = dataset.map(
-    #    #tokenize_and_tag,
-    #    convert_example_mapper_to_batch_mapper(tokenize_and_tag, [
-    #        'context_html',
-    #        'attributes.attribute',
-    #        'attributes.html_offset',
-    #        'ENE',
-    #    ]),
-    #    batched=True,
-    #    desc='Tokenizing and tagging',
-    #    batch_size=10,
-    #    writer_batch_size=10,
-    #    num_proc=args.num_workers,
-    #)
-    #logger.debug('dataset: %s', dataset)
-
-    #if args.split_eval_size> 0:
-    #    split_eval_size = args.split_eval_size
-    #    if split_eval_size >= 1:
-    #        split_eval_size = int(split_eval_size)
-    #    # ラベル付きデータを訓練用と評価用に分割
-    #    # ページ単位で分割することが好ましいので、ウィンドウ化よりも前に行う必要あり
-    #    dataset = dataset['train'].train_test_split(
-    #        test_size=split_eval_size,
-    #        seed=args.seed
-    #    )
-    #    logger.debug('dataset: %s', dataset)
-    ##logger.debug('dataset test page_id: %s', dataset['test']['page_id'])
-
-    # 通常、512トークンを超える系列の処理はそのままできないため、
-    # スライドウィンドウを用いて分割する
-    # (データセットのチャンク分割はバッチ処理でのみ可能)
-    #def split_into_windows(example):
-    #    windows = []
-    #    tokens = example['tokens']
-    #    tags = example['tags']
-    #    for window_id, i in enumerate(
-    #        range(0, len(tokens), args.window_size - args.window_overlap_size)
-    #    ):
-    #        window_tokens = tokens[i:i+args.window_size]
-    #        #window_tags = [tag_list[i:i+args.window_size] for tag_list in tags]
-    #        window_tags = [
-    #            tag_list[i:i+args.window_size] if tag_list is not None
-    #            else None
-    #            for tag_list in tags
-    #        ]
-    #        window = {}
-    #        window['page_id'] = example['page_id']
-    #        window['title'] = example['title']
-    #        window['category_name'] = example['category_name']
-    #        window['ENE'] = example['ENE']
-    #        window['window_id'] = window_id
-    #        window['tokens'] = window_tokens
-    #        window['tags'] = window_tags
-    #        windows.append(window)
-    #    return windows
-    
-    #dataset = dataset.map(
-    #    #split_into_windows,
-    #    convert_example_mapper_to_batch_mapper(split_into_windows, [
-    #        'page_id',
-    #        'title',
-    #        'category_name',
-    #        'ENE',
-    #        'tokens',
-    #        'tags',
-    #        'tokens',
-    #    ]),
-    #    desc='Splitting into slide windows',
-    #    batched=True,
-    #    remove_columns=dataset['train'].column_names,
-    #    batch_size=10,
-    #    writer_batch_size=10,
-    #    num_proc=args.num_workers,
-    #)
-    #logger.debug('dataset: %s', dataset)
-
-    #tag_list = ['O', 'B', 'I']
-    #map_tag_to_id = {tag: i for i, tag in enumerate(tag_list)}
-    #num_labels = len(tag_list)
-
-    ##logger.debug('attribute_names: %s', attribute_names)
-    ## トークン ID とタグ ID の付与
-    #def prepare_ids(example):
-    #    token_ids = tokenizer.encode(example['tokens'])
-    #    # 先頭 (CLS), 末尾 (SEP) はタグの予測不要
-    #    # BIO以外の文字(空白)はタグの予測不要
-    #    tag_ids = [
-    #        [-100] + [map_tag_to_id.get(char, -100) for char in tag_str] + [-100]
-    #        if tag_str is not None
-    #        else None
-    #        for tag_str in example['tags']
-    #    ]
-    #    return {
-    #        'input_ids': token_ids,
-    #        'tag_ids': tag_ids,
-    #    }
-    #dataset = dataset.map(
-    #    #prepare_ids,
-    #    convert_example_mapper_to_batch_mapper(prepare_ids, [
-    #        'tokens',
-    #        'tags',
-    #    ]),
-    #    batched=True,
-    #    desc='Converting tokens and tags into ids',
-    #    batch_size=10,
-    #    writer_batch_size=10,
-    #    num_proc=args.num_workers,
-    #)
-    #logger.debug('dataset: %s', dataset)
-    ##logger.debug('dataset["train"][0]: %s', dataset['train'][0])
-
-    num_attribute_names = len(preprocess_result.attribute_names)
-    tag_list = preprocess_result.tag_list
+    num_attribute_names = len(mapping.attribute_names)
+    tag_list = mapping.tag_list
 
     config = AutoConfig.from_pretrained(
         args.model_name_or_path,
@@ -622,37 +465,16 @@ def main():
         pretrained_model_name_or_path=args.model_name_or_path,
         config=config,
         num_attribute_names = num_attribute_names,
-        #num_attribute_names = len(preprocess_result.attribute_names),
     )
     logger.debug('model: %s', model)
 
-    #model.config.label2id = map_tag_to_id
-    #model.config.id2label = tag_list
-    model.config.id2label = preprocess_result.tag_list
-    model.config.label2id = preprocess_result.map_tag_to_id
+    model.config.id2label = mapping.tag_list
+    model.config.label2id = mapping.map_tag_to_id
 
     logger.debug('new model.config: %s', model.config)
 
     train_dataset = dataset['train']
     eval_dataset = dataset['test']
-
-    #map_page_id_to_information = {}
-    #def record_information(example):
-    #    keys = [
-    #        'page_id',
-    #        'title',
-    #        'category_name',
-    #        'ENE',
-    #    ]
-    #    page_id = example['page_id']
-    #    info = {
-    #        key: example[key] for key in keys
-    #    }
-    #    map_page_id_to_information[page_id] = info
-    #raw_dataset.map(
-    #    record_information,
-    #    desc='Recording page information',
-    #)
 
     #resuming = False
     skip_collation = False
@@ -668,23 +490,27 @@ def main():
             torch.tensor(example['input_ids'], dtype=torch.int64)
             for example in examples
         ]
-        # cuda の nll_loss のターゲットは long にしか対応していない模様
-        tag_ids = [
-            [
-                tag_id_list if tag_id_list is not None
-                else [-100] * len(example['input_ids'])
-                for tag_id_list in example['tag_ids']
-            ]
-            for example in examples
-        ] # [batch_size, num_attribute_names, window_length]
-        #tag_ids = [
-        #    torch.tensor(example['tag_ids'], dtype=torch.int64).transpose(1, 0)
-        #    for example in examples
-        #]
-        tag_ids = [
-            torch.tensor(tag_id_list, dtype=torch.int64).transpose(1, 0) # [A, L] -> [L, A]
-            for tag_id_list in tag_ids
-        ] # [batch_size, window_length, num_attribute_names]
+        if 'tag_ids' in examples[0]:
+            # cuda の nll_loss のターゲットは long にしか対応していない模様
+            tag_ids = [
+                [
+                    tag_id_list if tag_id_list is not None
+                    else [-100] * len(example['input_ids'])
+                    for tag_id_list in example['tag_ids']
+                ]
+                for example in examples
+            ] # [batch_size, num_attribute_names, window_length]
+            #tag_ids = [
+            #    torch.tensor(example['tag_ids'], dtype=torch.int64).transpose(1, 0)
+            #    for example in examples
+            #]
+            tag_ids = [
+                torch.tensor(tag_id_list, dtype=torch.int64).transpose(1, 0) # [A, L] -> [L, A]
+                for tag_id_list in tag_ids
+            ] # [batch_size, window_length, num_attribute_names]
+            tag_ids = pad_sequence(tag_ids, batch_first=True, padding_value=-100)
+        else:
+            tag_ids = None
         mask = [
             torch.ones(len(ids), dtype=torch.bool) for ids in input_ids
         ]
@@ -694,10 +520,12 @@ def main():
         ]
         return {
             'input_ids': pad_sequence(input_ids, batch_first=True),
-            'tag_ids': pad_sequence(tag_ids, batch_first=True, padding_value=-100),
+            'tag_ids': tag_ids,
             'attention_mask': pad_sequence(mask, batch_first=True),
             'token_type_ids': pad_sequence(token_type_ids, batch_first=True),
             'page_id': [example['page_id'] for example in examples],
+            'window_id': [example['window_id'] for example in examples],
+            'ENE': [example['ENE'] for example in examples],
         }
     data_collator = my_collator
         
@@ -855,7 +683,8 @@ def main():
                 "f1": results["overall_f1"],
                 "accuracy": results["overall_accuracy"],
             }
-        
+
+    resume_path = None  
     if args.resume_from_checkpoint:
         accelerator.print(f"Resumed from checkpoint {args.resume_from_checkpoint}")
         accelerator.load_state(args.resume_from_checkpoint)
@@ -870,16 +699,9 @@ def main():
             d for d in dirs if os.path.isfile(os.path.join(d, "status.json"))
         ]
         if len(dirs) > 0:
-            #dirs.sort(key=os.path.getctime)
             dirs.sort(key=os.path.getmtime)
-            #path = dirs[-1] # Sorts folders by date modified, most recent checkpoint is the last
             resume_path = dirs[-1] # Sorts folders by date modified, most recent checkpoint is the last
-            #resume_path = os.path.join(args.output_dir, dirs[-1])
-            #logger.debug('path: %s', path)
-            #resume_path = get_last_checkpoint(args.output_dir)
-            #logger.debug('resume_path: %s', resume_path)
             accelerator.load_state(resume_path)
-            #resuming = True
     logger.debug('resume_path: %s', resume_path)
 
     def save_best_status(eval_metric):
@@ -909,6 +731,9 @@ def main():
         )):
             with torch.no_grad():
                 #outputs = model(**batch)
+                #logger.debug('model.device: %s', model.device)
+                #logger.debug('batch input_ids device: %s', batch['input_ids'].device)
+                #logger.debug('batch tag_ids device: %s', batch['tag_ids'].device)
                 outputs = model(
                     input_ids = batch['input_ids'],
                     tag_ids = batch['tag_ids'],
@@ -957,6 +782,50 @@ def main():
             status_path = os.path.join(output_dir, 'status.json')
             with open(status_path, "w", encoding='utf-8') as f:
                 json.dump(status, f, indent=2, sort_keys=True, ensure_ascii=False)
+
+    #def extract(f_out, html_lines, start_line, start_offset, end_line, end_offset): 
+    #def extract(f_out, html_lines, html_offset):
+    def extract(f_out, html_lines, offsets):
+        text = ''
+        start_line = offsets['start_line']
+        start_offset = offsets['start_offset']
+        end_line = offsets['end_line']
+        end_offset = offsets['end_offset']
+        for line_index in range(start_line, end_line+1):
+            if start_line == end_line:
+                line = html_lines[line_index][start_offset:end_offset]
+            # (start_line < end_line)
+            elif line_index == start_line:
+                line = html_lines[line_index][start_offset:]
+            elif line_index == end_line:
+                line = html_lines[line_index][:end_offset]
+            else:
+                line = html_lines[line_index]
+            text += line
+        data = {}
+        data['page_id'] = page_id
+        data['title'] = title
+        data['ENE'] = ene
+        data['attribute'] = attribute_name
+        data['html_offset'] = {
+            #'start_line': start_line,
+            #'start_offset': start_offset,
+            #'end_line': end_line,
+            #'end_offset': end_offset,
+            'start': {
+                'line_id': start_line,
+                'offset': start_offset,
+            },
+            'end': {
+                'line_id': end_line,
+                'offset': end_offset,
+            },
+            'text': text,
+        }
+        #data['html_offset'] = html_offset
+        #logger.debug('found: %s', data)
+        f_out.write(json.dumps(data, ensure_ascii=False))
+        f_out.write('\n')
 
     if args.do_train:
         # Train!
@@ -1145,6 +1014,191 @@ def main():
         logger.info("  Instantaneous batch size per device = %d", args.per_device_eval_batch_size)
         eval_metric = do_eval()
         logger.info(f'eval_metric: {eval_metric}')
+
+    if args.do_predict:
+        logger.info("***** Running prediction *****")
+        logger.info("  Num examples = %d", len(predict_dataset))
+        logger.info("  Instantaneous batch size per device = %d", args.per_device_eval_batch_size)
+        predict_dataloader = DataLoader(
+            predict_dataset,
+            collate_fn=data_collator,
+            batch_size=args.per_device_predict_batch_size,
+            num_workers=args.num_workers,
+        )
+
+        model, predict_dataloader = accelerator.prepare(
+            model, predict_dataloader,
+        )
+
+        model.eval()
+        map_page_id_and_window_id_to_prediction = OrderedDict()
+        # 推論した結果を page_id と window_id で紐付ける
+        for step, batch in enumerate(tqdm(
+            predict_dataloader,
+            desc='Feeding for prediction',
+        )):
+            #if step > 100:
+            #    break
+            page_ids = batch['page_id']
+            window_ids = batch['window_id']
+            enes = batch['ENE']
+            with torch.no_grad():
+                outputs = model(
+                    input_ids = batch['input_ids'],
+                    attention_mask = batch.get('attention_mask'),
+                    token_type_ids = batch.get('token_type_ids'),
+                )
+            predictions = outputs.logits.argmax(dim=-1)
+            page_ids_gathered, window_ids_gathered, predictions_gathered = \
+                accelerator.gather([page_ids, window_ids, predictions])
+            page_ids = page_ids_gathered
+            window_ids = window_ids_gathered
+            if device.type == "cpu":
+                predictions = predictions_gathered.detach().clone().numpy()
+
+            else:
+                predictions = predictions_gathered.detach().cpu().clone().numpy()
+            predictions = predictions.transpose(0, 2, 1) # [B, L, A] -> [B, A, L]
+            predictions = predictions[:, :, 1:] # 1トークン目はCLSなので除去
+            #logger.debug('new predictions shape: %s', predictions.shape)
+            #logger.debug('predictions shape: %s', predictions.shape)
+            #for page_id, window_id, pred in zip(page_ids, window_ids, predictions):
+            #logger.debug('enes: %s', enes)
+            for page_id, window_id, ene, pred in zip(
+                page_ids, window_ids, enes, predictions
+            ):
+                #logger.debug('page_id: %s', page_id)
+                #logger.debug('window_id: %s', window_id)
+                #logger.debug('ene: %s', enes)
+                #logger.debug('pred: %s', pred)
+                #map_page_id_and_window_id_to_prediction[page_id, window_id] = pred.astype(np.int8)
+                # 推論の必要の無い属性名は None にしてメモリと計算量の節約
+                attribute_id_counter = mapping.map_ene_to_attribute_id_counter[ene]
+                pred_list = [
+                    None if attribute_id not in attribute_id_counter
+                    else p.astype(np.int8)
+                    for attribute_id, p in enumerate(pred)
+                ]
+                map_page_id_and_window_id_to_prediction[page_id, window_id] = pred_list
+
+        # page_id と window_id と推論結果を元に
+        # page_id に推論結果を集約
+        map_page_id_to_predictions = OrderedDict()
+        def merge_predictions(example):
+            page_id, window_id = example['page_id'], example['window_id']
+            prediction = map_page_id_and_window_id_to_prediction.get(
+                (page_id, window_id)
+            )
+            if prediction is None:
+                return
+            example['prediction'] = prediction
+            map_page_id_to_predictions.setdefault(page_id, []).append(example)
+        predict_dataset.map(
+            merge_predictions,
+            desc='Merging windowed predictions into pages',
+            #batched=True,
+            #remove_columns=predict_dataset.column_names,
+            load_from_cache_file=False,
+        )
+        #logger.debug('predicted page ids: %s', map_page_id_to_predicted_windows.keys())
+
+        # ウィンドウをマージしつつ推論結果を出力
+        with open(args.predict_output_jsonl, 'w', encoding='utf-8') as f:
+            for page_id, windows in tqdm(
+                map_page_id_to_predictions.items(),
+                #desc='Merging windows',
+                desc='Extracting predicted attributes',
+            ):
+                #logger.debug('page_id: %s', page_id)
+                #logger.debug('windows: %s', windows)
+                tokens_with_offsets = []
+                #tags = []
+                tag_ids = np.array([], dtype=np.int8).reshape(num_attribute_names, 0)
+                #logger.debug('page_id: %s', page_id)
+                #logger.debug('windows type: %s', type(windows))
+                # リスト・配列を拡張しながらウィンドウをマージ
+                #logger.debug('windows: %s', windows)
+                for window in windows:
+                    #logger.debug('window: %s', window)
+                    title = window['title']
+                    ene = window['ENE']
+                    window_start = window['window_id'] * (args.window_size - args.window_overlap_size)
+                    window_end = window_start + len(window['tokens'])
+                    #if window_end > len(tags):
+                    if window_end > len(tokens_with_offsets):
+                        #extension_length = window_end - len(tags)
+                        extension_length = window_end - len(tokens_with_offsets)
+                        #tags.extend([mapping.map_tag_to_id['O']] * (window_end - len(tags)))
+                        #tags.extend([None] * extension_length)
+                        tokens_with_offsets.extend([None] * extension_length)
+                        tag_ids_extension = np.zeros(
+                            [num_attribute_names, extension_length],
+                            dtype=np.int8
+                        )
+                        #logger.debug('tag_ids.shape: %s', tag_ids.shape)
+                        #logger.debug('tag_ids_extension.shape: %s', tag_ids_extension.shape)
+                        tag_ids = np.concatenate([tag_ids, tag_ids_extension], axis=1)
+                        #logger.debug('new tag_ids.shape: %s', tag_ids.shape)
+                    for i, token_with_offset in enumerate(window['tokens_with_offsets']):
+                        tokens_with_offsets[window_start+i] = token_with_offset
+                    #logger.debug('window prediction shape: %s', window['prediction'].shape)
+                    #if window['prediction'] is None:
+                    #    continue
+                    #attribute_name_counter = mapping.map_ene_to_attribute_name_counter.get(ene)
+                    #if attribute_name_counter is None:
+                    #    break
+                    for attribute_index, attribute_tag_ids in enumerate(window['prediction']):
+                        if attribute_tag_ids is None:
+                            continue
+                        #attribute_name = mapping.attribute_names[attribute_index]
+                        #if attribute_name not in attribute_name_counter:
+                        #    continue
+                        for i, tag_id in enumerate(attribute_tag_ids):
+                            if i >= len(window['tokens']):
+                                break
+                            tag = mapping.tag_list[tag_id]
+                            if tag in ['B', 'I']:
+                                previous_tag_id = tag_ids[attribute_index, window_start+i]
+                                previous_tag = mapping.tag_list[previous_tag_id]
+                                if previous_tag == 'O':
+                                    tag_ids[attribute_index, window_start+i] = tag_id
+                html_path = os.path.join(args.predict_html_dir, f'{page_id}.html')
+                with open(html_path, 'r', encoding='utf-8') as f_html:
+                    html_lines = f_html.read().splitlines(keepends=True)
+                #attribute_name_counter = mapping.map_ene_to_attribute_name_counter[ene]
+                attribute_id_counter = mapping.map_ene_to_attribute_id_counter[ene]
+                #attribute_name_counter = mapping.map_ene_to_attribute_name_counter.get(ene)
+                #if attribute_name_counter is None:
+                #    continue
+                for attribute_index, attribute_tag_ids in enumerate(tag_ids):
+                    attribute_name = mapping.attribute_names[attribute_index]
+                    #if attribute_name not in attribute_name_counter:
+                    #    continue
+                    if attribute_index not in attribute_id_counter:
+                        continue
+                    found_b = False
+                    offsets = {}
+                    for i, tag_id in enumerate(attribute_tag_ids):
+                        tag = mapping.tag_list[tag_id]
+                        token_with_offsets = tokens_with_offsets[i]
+                        if tag == 'B':
+                            if found_b:
+                                extract(f, html_lines, offsets)
+                            #logger.debug('B tag')
+                            found_b = True
+                            offsets['start_line'] = token_with_offsets["start_line"]
+                            offsets['start_offset'] = token_with_offsets["start_offset"]
+                            offsets['end_line'] = token_with_offsets["end_line"]
+                            offsets['end_offset'] = token_with_offsets["end_offset"]
+                        if tag == 'I':
+                            offsets['end_line'] = token_with_offsets["end_line"]
+                            offsets['end_offset'] = token_with_offsets["end_offset"]
+                        if tag == 'O':
+                            if found_b:
+                                found_b = False
+                                extract(f, html_lines, offsets)
+                    if found_b:
+                        extract(f, html_lines, offsets)
 
 if __name__ == '__main__':
     main()
