@@ -285,6 +285,22 @@ def parse_args():
         ),
     )
 
+    parser.add_argument(
+        "--model_with_crf",
+        action="store_true",
+        help=(
+            "Whether or not to use a CRF on top of the model."
+        ),
+    )
+
+    parser.add_argument(
+        "--omit_windows_without_entities",
+        action="store_true",
+        help=(
+            "Whether or not to omit windows without entities."
+        ),
+    )
+
     args = parser.parse_args()
 
     if args.do_predict:
@@ -367,6 +383,7 @@ def main():
         seed = args.seed,
         window_size = args.window_size,
         window_overlap_size = args.window_overlap_size,
+        omit_windows_without_entities = args.omit_windows_without_entities,
     )
     dataset = preprocess_result.dataset
     mapping = preprocess_result.mapping
@@ -402,6 +419,7 @@ def main():
         pretrained_model_name_or_path=args.model_name_or_path,
         config=config,
         num_attribute_names = num_attribute_names,
+        use_crf = args.model_with_crf,
     )
     logger.debug('model: %s', model)
 
@@ -554,15 +572,25 @@ def main():
 
     def get_labels(predictions, references):
         # Transform predictions and references tensors to numpy arrays
-        if device.type == "cpu":
-            y_pred = predictions.detach().clone().numpy()
-            y_true = references.detach().clone().numpy()
-        else:
-            y_pred = predictions.detach().cpu().clone().numpy()
-            y_true = references.detach().cpu().clone().numpy()
+        #if device.type == "cpu":
+        #    if isinstance(predictions, list):
+        #        y_pred = predictions
+        #    else:
+        #        y_pred = predictions.detach().clone().numpy()
+        #    y_true = references.detach().clone().numpy()
+        #else:
+        #    if isinstance(predictions, list):
+        #        y_pred = predictions
+        #    else:
+        #        y_pred = predictions.detach().cpu().clone().numpy()
+        #    y_true = references.detach().cpu().clone().numpy()
+        y_pred = predictions.detach().cpu().clone().numpy()
+        y_true = references.detach().cpu().clone().numpy()
 
         batch_size = y_pred.shape[0]
         seq_len = y_pred.shape[1]
+        #batch_size = y_true.shape[0]
+        #seq_len = y_true.shape[1]
         # [B, L, A] -> [B, A, L]
         #y_pred = y_pred.transpose(0, 2, 1)
         #y_true = y_true.transpose(0, 2, 1)
@@ -676,8 +704,10 @@ def main():
                     tag_ids = batch['tag_ids'],
                     attention_mask = batch.get('attention_mask'),
                     token_type_ids = batch.get('token_type_ids'),
+                    decode=True,
                 )
-            predictions = outputs.logits.argmax(dim=-1)
+            #predictions = outputs.logits.argmax(dim=-1)
+            predictions = outputs['decoded']
             tag_ids = batch["tag_ids"]
             predictions_gathered, tags_gathered = accelerator.gather([predictions, tag_ids])
             # If we are in a multi-process environment,
@@ -856,13 +886,16 @@ def main():
                     attention_mask = batch.get('attention_mask'),
                     token_type_ids = batch.get('token_type_ids'),
                 )
-                loss = outputs.loss
+                #loss = outputs.loss
+                loss = outputs['loss']
+                #logger.debug('loss: %s', loss)
                 # We keep track of the loss at each epoch
-                total_loss += loss.detach().float()
-                loss = loss / args.gradient_accumulation_steps
-                #fed_samples += len(batch["input_ids"])
+                if loss is not None:
+                    total_loss += loss.detach().float()
+                    loss = loss / args.gradient_accumulation_steps
+                    #fed_samples += len(batch["input_ids"])
+                    accelerator.backward(loss)
                 fed_iterations += 1
-                accelerator.backward(loss)
                 if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                     optimizer.step()
                     lr_scheduler.step()
@@ -914,7 +947,7 @@ def main():
 
             # 各エポック毎のモデルは毎回保存
             #output_dir = f"epoch_{epoch}"
-                zero_filled_step = str(completed_steps).zfill(len(str(args.max_train_steps - 1)))
+            zero_filled_step = str(completed_steps).zfill(len(str(args.max_train_steps - 1)))
             output_dir = f"epoch_{zero_filled_epoch}_step_{zero_filled_step}"
             #if args.output_dir is not None:
             #    output_dir = os.path.join(args.output_dir, output_dir)
@@ -984,17 +1017,20 @@ def main():
                     input_ids = batch['input_ids'],
                     attention_mask = batch.get('attention_mask'),
                     token_type_ids = batch.get('token_type_ids'),
+                    decoded=True,
                 )
-            predictions = outputs.logits.argmax(dim=-1)
+            #predictions = outputs.logits.argmax(dim=-1)
+            predictions = outputs['decoded']
             page_ids_gathered, window_ids_gathered, predictions_gathered = \
                 accelerator.gather([page_ids, window_ids, predictions])
             page_ids = page_ids_gathered
             window_ids = window_ids_gathered
-            if device.type == "cpu":
-                predictions = predictions_gathered.detach().clone().numpy()
+            #if device.type == "cpu":
+            #    predictions = predictions_gathered.detach().clone().numpy()
 
-            else:
-                predictions = predictions_gathered.detach().cpu().clone().numpy()
+            #else:
+            #    predictions = predictions_gathered.detach().cpu().clone().numpy()
+            predictions = predictions_gathered.detach().cpu().clone().numpy()
             predictions = predictions.transpose(0, 2, 1) # [B, L, A] -> [B, A, L]
             predictions = predictions[:, :, 1:] # 1トークン目はCLSなので除去
             #logger.debug('new predictions shape: %s', predictions.shape)

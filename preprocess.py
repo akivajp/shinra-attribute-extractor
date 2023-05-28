@@ -178,6 +178,7 @@ def tokenize_and_tag(
 def split_into_windows(
     window_size = 510,
     window_overlap_size = 128,
+    omit_windows_without_entities = False,
 ):
     def _split_into_windows(example):
         windows = []
@@ -250,6 +251,7 @@ def preprocess_for_training(
     split_eval_size = 0,
     window_size = 510,
     window_overlap_size = 128,
+    omit_windows_without_entities = False,
 ):
     dataset = raw_dataset
 
@@ -357,6 +359,7 @@ def preprocess_for_training(
             split_into_windows(
                 window_size,
                 window_overlap_size,
+                omit_windows_without_entities,
             ), [
                 'page_id',
                 'title',
