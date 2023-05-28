@@ -81,6 +81,7 @@ class TokenMultiClassificationModel(transformers.PreTrainedModel):
 
         loss = None
         decoded = None
+        scores = None
             
         if tag_ids is not None:
             if self.use_crf:
@@ -115,6 +116,8 @@ class TokenMultiClassificationModel(transformers.PreTrainedModel):
                 decoded = decoded.transpose(1, 2) # [B, L, A]
             else:
                 decoded = logits.argmax(dim=-1)
+                probs = torch.nn.functional.softmax(logits, dim=-1) # [B, L, A, C]
+                scores = probs.max(dim=-1).values # [B, L, A]
 
         #return transformers.modeling_outputs.MultipleChoiceModelOutput(
         #    loss=loss,
@@ -124,6 +127,7 @@ class TokenMultiClassificationModel(transformers.PreTrainedModel):
             loss=loss,
             logits=logits,
             decoded=decoded,
+            scores=scores,
         )
 
     #def decode(self, logits):
