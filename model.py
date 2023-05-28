@@ -94,25 +94,27 @@ class TokenMultiClassificationModel(transformers.PreTrainedModel):
                         mask=mask.transpose(1, 2).reshape(-1, seq_length), # [B*A, L]
                         reduction='mean'
                     )
-                if decode:
-                    decoded = self.crf.decode(
-                        logits.transpose(1, 2).reshape(-1, seq_length, num_labels), # [B*A, L, C]
-                        mask=mask.transpose(1, 2).reshape(-1, seq_length), # [B*A, L]
-                    )
-                    decoded = torch.stack([
-                        torch.nn.ConstantPad1d([0, seq_length - len(tags)], -100)(
-                            torch.tensor(tags)
-                        )
-                        for tags in decoded
-                    ])
-                    # [B * A, L] -> [B, A, L]
-                    decoded = decoded.reshape(batch_size, num_attribute_names, seq_length)
-                    decoded = decoded.transpose(1, 2) # [B, L, A]
             else:
                 loss_fct = torch.nn.CrossEntropyLoss()
                 loss = loss_fct(logits.view(-1, self.num_labels), tag_ids.view(-1))
-                if decode:
-                    decoded = logits.argmax(dim=-1)
+
+        if decode:
+            if self.use_crf:
+                decoded = self.crf.decode(
+                    logits.transpose(1, 2).reshape(-1, seq_length, num_labels), # [B*A, L, C]
+                    mask=mask.transpose(1, 2).reshape(-1, seq_length), # [B*A, L]
+                )
+                decoded = torch.stack([
+                    torch.nn.ConstantPad1d([0, seq_length - len(tags)], -100)(
+                        torch.tensor(tags)
+                    )
+                    for tags in decoded
+                ])
+                # [B * A, L] -> [B, A, L]
+                decoded = decoded.reshape(batch_size, num_attribute_names, seq_length)
+                decoded = decoded.transpose(1, 2) # [B, L, A]
+            else:
+                decoded = logits.argmax(dim=-1)
 
         #return transformers.modeling_outputs.MultipleChoiceModelOutput(
         #    loss=loss,

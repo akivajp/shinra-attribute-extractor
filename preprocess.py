@@ -309,7 +309,7 @@ def preprocess_for_training(
     dataset = dataset.map(
         convert_example_mapper_to_batch_mapper(clean_context_html, ['context_html']),
         batched=True,
-        desc='Cleaning HTML files',
+        desc='Cleaning HTML data',
         batch_size=10,
         writer_batch_size=10,
         num_proc=num_workers,
@@ -491,7 +491,8 @@ def split_into_individual_enes(example):
     return splitted_examples
 
 def prepare_for_prediction(
-    input_jsonl_path,
+    #input_jsonl_path,
+    dataset: Dataset,
     input_html_dir,
     mapping: LabelIdMapping,
     tokenizer: PreTrainedTokenizer,
@@ -499,17 +500,18 @@ def prepare_for_prediction(
     window_size = 510,
     window_overlap_size = 128,
 ):
-    logger.debug('loading from %s', input_jsonl_path)
-    dataset = load_dataset('json', data_files={'predict': input_jsonl_path})
-    dataset = dataset['predict']
+    #logger.debug('loading from %s', input_jsonl_path)
+    #dataset = load_dataset('json', data_files={'predict': input_jsonl_path})
+    #dataset = dataset['predict']
 
     dataset = dataset.map(
         convert_example_mapper_to_batch_mapper(convert_ene_predicts_to_ene_list, [ 'ENEs' ]),
         desc='Converting ENE predicts to ENE list',
         batched=True,
         num_proc=num_workers,
+        load_from_cache_file=False,
     )
-    logger.debug('dataset: %s', dataset)
+    #logger.debug('dataset: %s', dataset)
 
     dataset = dataset.map(
         convert_example_mapper_to_batch_mapper(
@@ -524,12 +526,14 @@ def prepare_for_prediction(
         batched=True,
         num_proc=num_workers,
         remove_columns=dataset.column_names,
+        load_from_cache_file=False,
     )
-    logger.debug('dataset: %s', dataset)
+    #logger.debug('dataset: %s', dataset)
 
     dataset = dataset.filter(
         filter_by_ene(mapping.map_ene_to_attribute_name_counter),
         desc='Filtering by ENE',
+        load_from_cache_file=False,
     )
 
     dataset = dataset.map(
@@ -537,8 +541,9 @@ def prepare_for_prediction(
         desc='Loading HTML files',
         batched=True,
         num_proc=num_workers,
+        load_from_cache_file=False,
     )
-    logger.debug('dataset: %s', dataset)
+    #logger.debug('dataset: %s', dataset)
 
     dataset = dataset.map(
         convert_example_mapper_to_batch_mapper(clean_context_html, ['context_html']),
@@ -547,8 +552,9 @@ def prepare_for_prediction(
         batch_size=10,
         writer_batch_size=10,
         num_proc=num_workers,
+        load_from_cache_file=False,
     )
-    logger.debug('dataset: %s', dataset)
+    #logger.debug('dataset: %s', dataset)
 
     dataset = dataset.map(
         convert_example_mapper_to_batch_mapper(
@@ -564,8 +570,9 @@ def prepare_for_prediction(
         batch_size=10,
         writer_batch_size=10,
         num_proc=num_workers,
+        load_from_cache_file=False,
     )
-    logger.debug('dataset: %s', dataset)
+    #logger.debug('dataset: %s', dataset)
 
     dataset = dataset.map(
         convert_example_mapper_to_batch_mapper(
@@ -586,11 +593,9 @@ def prepare_for_prediction(
         batch_size=10,
         writer_batch_size=10,
         num_proc=num_workers,
+        load_from_cache_file=False,
     )
-    logger.debug('dataset: %s', dataset)
-
-    #tag_list = mapping.tag_list
-    #map_tag_to_id = mapping.map_tag_to_id
+    #logger.debug('dataset: %s', dataset)
 
     dataset = dataset.map(
         convert_example_mapper_to_batch_mapper(
@@ -607,7 +612,8 @@ def prepare_for_prediction(
         batch_size=10,
         writer_batch_size=10,
         num_proc=num_workers,
+        load_from_cache_file=False,
     )
-    logger.debug('dataset: %s', dataset)
+    #logger.debug('dataset: %s', dataset)
 
     return dataset

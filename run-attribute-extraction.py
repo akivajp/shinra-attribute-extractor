@@ -301,6 +301,15 @@ def parse_args():
         ),
     )
 
+    parser.add_argument(
+        "--predict_chunk_size",
+        type=int,
+        default=10,
+        help=(
+            "The number of pages to be processed at once."
+        )
+    )
+
     args = parser.parse_args()
 
     if args.do_predict:
@@ -391,17 +400,10 @@ def main():
     if args.do_predict:
         #with open(args.predict_input_jsonl, 'r', encoding='utf-8') as f:
         #    predict_input = [json.loads(line) for line in f]
-
-        predict_dataset = prepare_for_prediction(
-            args.predict_input_jsonl,
-            args.predict_html_dir,
-            mapping,
-            tokenizer,
-            num_workers = args.num_workers,
-            window_size = args.window_size,
-            window_overlap_size = args.window_overlap_size,
-        )
-        logger.debug('predict_dataset: %s', predict_dataset)
+        
+        logger.debug('loading from %s', args.predict_input_jsonl)
+        raw_predict_dataset = load_dataset('json', data_files={'predict': args.predict_input_jsonl})
+        raw_predict_dataset = raw_predict_dataset['predict']
 
         #sys.exit(1)
 
@@ -499,27 +501,30 @@ def main():
     )
     logger.debug('train_dataloader: %s', train_dataloader)
 
-    # Optimizer
-    # Split weights in two groups, one with weight decay and the other not.
-    no_decay = ["bias", "LayerNorm.weight"]
-    optimizer_grouped_parameters = [
-        {
-            "params": [
-                p for n, p in model.named_parameters()
-                if not any(nd in n for nd in no_decay)
-            ],
-            "weight_decay": args.weight_decay,
-        },
-        {
-            "params": [
-                p for n, p in model.named_parameters()
-                if any(nd in n for nd in no_decay)
-            ],
-            "weight_decay": 0.0,
-        }
-    ]
-    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
-    logger.debug('optimizer: %s', optimizer)
+    if args.do_train:
+        # Optimizer
+        # Split weights in two groups, one with weight decay and the other not.
+        no_decay = ["bias", "LayerNorm.weight"]
+        optimizer_grouped_parameters = [
+            {
+                "params": [
+                    p for n, p in model.named_parameters()
+                    if not any(nd in n for nd in no_decay)
+                ],
+                "weight_decay": args.weight_decay,
+            },
+            {
+                "params": [
+                    p for n, p in model.named_parameters()
+                    if any(nd in n for nd in no_decay)
+                ],
+                "weight_decay": 0.0,
+            }
+        ]
+        optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+        logger.debug('optimizer: %s', optimizer)
+    else:
+        optimizer = None
 
     # Use the device given by the `accelerator` object.
     device = accelerator.device
@@ -527,17 +532,21 @@ def main():
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    num_update_steps_per_epoch = \
+        math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
 
-    lr_scheduler = get_scheduler(
-        name=args.lr_scheduler_type,
-        optimizer=optimizer,
-        num_warmup_steps=args.num_warmup_steps,
-        num_training_steps=args.max_train_steps,
-    )
+    if args.do_train:
+        lr_scheduler = get_scheduler(
+            name=args.lr_scheduler_type,
+            optimizer=optimizer,
+            num_warmup_steps=args.num_warmup_steps,
+            num_training_steps=args.max_train_steps,
+        )
+    else:
+        lr_scheduler = None
 
     # Prepare everything with our `accelerator`.
     model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
@@ -987,191 +996,187 @@ def main():
 
     if args.do_predict:
         logger.info("***** Running prediction *****")
-        logger.info("  Num examples = %d", len(predict_dataset))
+        logger.info("  Num examples = %d", len(raw_predict_dataset))
         logger.info("  Instantaneous batch size per device = %d", args.per_device_eval_batch_size)
-        predict_dataloader = DataLoader(
-            predict_dataset,
-            collate_fn=data_collator,
-            batch_size=args.per_device_predict_batch_size,
-            num_workers=args.num_workers,
+
+        def filter_page_id_with_html(example):
+            page_id = example['page_id']
+            html_path = os.path.join(args.predict_html_dir, page_id + '.html')
+            return os.path.isfile(html_path)
+        filtered_dataset = raw_predict_dataset.filter(
+            filter_page_id_with_html,
+            desc = 'Filtering page_id with html',
         )
 
-        model, predict_dataloader = accelerator.prepare(
-            model, predict_dataloader,
-        )
-
-        model.eval()
-        map_page_id_and_window_id_to_prediction = OrderedDict()
-        # 推論した結果を page_id と window_id で紐付ける
-        for step, batch in enumerate(tqdm(
-            predict_dataloader,
-            desc='Feeding for prediction',
-        )):
-            #if step > 100:
-            #    break
-            page_ids = batch['page_id']
-            window_ids = batch['window_id']
-            enes = batch['ENE']
-            with torch.no_grad():
-                outputs = model(
-                    input_ids = batch['input_ids'],
-                    attention_mask = batch.get('attention_mask'),
-                    token_type_ids = batch.get('token_type_ids'),
-                    decoded=True,
-                )
-            #predictions = outputs.logits.argmax(dim=-1)
-            predictions = outputs['decoded']
-            page_ids_gathered, window_ids_gathered, predictions_gathered = \
-                accelerator.gather([page_ids, window_ids, predictions])
-            page_ids = page_ids_gathered
-            window_ids = window_ids_gathered
-            #if device.type == "cpu":
-            #    predictions = predictions_gathered.detach().clone().numpy()
-
-            #else:
-            #    predictions = predictions_gathered.detach().cpu().clone().numpy()
-            predictions = predictions_gathered.detach().cpu().clone().numpy()
-            predictions = predictions.transpose(0, 2, 1) # [B, L, A] -> [B, A, L]
-            predictions = predictions[:, :, 1:] # 1トークン目はCLSなので除去
-            #logger.debug('new predictions shape: %s', predictions.shape)
-            #logger.debug('predictions shape: %s', predictions.shape)
-            #for page_id, window_id, pred in zip(page_ids, window_ids, predictions):
-            #logger.debug('enes: %s', enes)
-            for page_id, window_id, ene, pred in zip(
-                page_ids, window_ids, enes, predictions
-            ):
-                #logger.debug('page_id: %s', page_id)
-                #logger.debug('window_id: %s', window_id)
-                #logger.debug('ene: %s', enes)
-                #logger.debug('pred: %s', pred)
-                #map_page_id_and_window_id_to_prediction[page_id, window_id] = pred.astype(np.int8)
-                # 推論の必要の無い属性名は None にしてメモリと計算量の節約
-                attribute_id_counter = mapping.map_ene_to_attribute_id_counter[ene]
-                pred_list = [
-                    None if attribute_id not in attribute_id_counter
-                    else p.astype(np.int8)
-                    for attribute_id, p in enumerate(pred)
-                ]
-                map_page_id_and_window_id_to_prediction[page_id, window_id] = pred_list
-
-        # page_id と window_id と推論結果を元に
-        # page_id に推論結果を集約
-        map_page_id_to_predictions = OrderedDict()
-        def merge_predictions(example):
-            page_id, window_id = example['page_id'], example['window_id']
-            prediction = map_page_id_and_window_id_to_prediction.get(
-                (page_id, window_id)
+        predict_dataset_size = len(filtered_dataset)
+        for i in tqdm(
+            range(math.ceil(predict_dataset_size / args.predict_chunk_size)),
+            desc='Predicting all',
+        ):
+            # データセットから1件ずつ取り出して推論
+            chunk = filtered_dataset.shard(
+                math.ceil(predict_dataset_size / args.predict_chunk_size),
+                i,
+                contiguous=True,
             )
-            if prediction is None:
-                return
-            example['prediction'] = prediction
-            map_page_id_to_predictions.setdefault(page_id, []).append(example)
-        predict_dataset.map(
-            merge_predictions,
-            desc='Merging windowed predictions into pages',
-            #batched=True,
-            #remove_columns=predict_dataset.column_names,
-            load_from_cache_file=False,
-        )
-        #logger.debug('predicted page ids: %s', map_page_id_to_predicted_windows.keys())
+            predict_dataset = prepare_for_prediction(
+                chunk,
+                args.predict_html_dir,
+                mapping,
+                tokenizer,
+                num_workers = 1,
+                window_size = args.window_size,
+                window_overlap_size = args.window_overlap_size,
+            )
+            #logger.debug('predict_dataset: %s', predict_dataset)
 
-        # ウィンドウをマージしつつ推論結果を出力
-        with open(args.predict_output_jsonl, 'w', encoding='utf-8') as f:
-            for page_id, windows in tqdm(
-                map_page_id_to_predictions.items(),
-                #desc='Merging windows',
-                desc='Extracting predicted attributes',
-            ):
-                #logger.debug('page_id: %s', page_id)
-                #logger.debug('windows: %s', windows)
-                tokens_with_offsets = []
-                #tags = []
-                tag_ids = np.array([], dtype=np.int8).reshape(num_attribute_names, 0)
-                #logger.debug('page_id: %s', page_id)
-                #logger.debug('windows type: %s', type(windows))
-                # リスト・配列を拡張しながらウィンドウをマージ
-                #logger.debug('windows: %s', windows)
-                for window in windows:
-                    #logger.debug('window: %s', window)
-                    title = window['title']
-                    ene = window['ENE']
-                    window_start = window['window_id'] * (args.window_size - args.window_overlap_size)
-                    window_end = window_start + len(window['tokens'])
-                    #if window_end > len(tags):
-                    if window_end > len(tokens_with_offsets):
-                        #extension_length = window_end - len(tags)
-                        extension_length = window_end - len(tokens_with_offsets)
-                        #tags.extend([mapping.map_tag_to_id['O']] * (window_end - len(tags)))
-                        #tags.extend([None] * extension_length)
-                        tokens_with_offsets.extend([None] * extension_length)
-                        tag_ids_extension = np.zeros(
-                            [num_attribute_names, extension_length],
-                            dtype=np.int8
-                        )
-                        #logger.debug('tag_ids.shape: %s', tag_ids.shape)
-                        #logger.debug('tag_ids_extension.shape: %s', tag_ids_extension.shape)
-                        tag_ids = np.concatenate([tag_ids, tag_ids_extension], axis=1)
-                        #logger.debug('new tag_ids.shape: %s', tag_ids.shape)
-                    for i, token_with_offset in enumerate(window['tokens_with_offsets']):
-                        tokens_with_offsets[window_start+i] = token_with_offset
-                    #logger.debug('window prediction shape: %s', window['prediction'].shape)
-                    #if window['prediction'] is None:
-                    #    continue
-                    #attribute_name_counter = mapping.map_ene_to_attribute_name_counter.get(ene)
-                    #if attribute_name_counter is None:
-                    #    break
-                    for attribute_index, attribute_tag_ids in enumerate(window['prediction']):
-                        if attribute_tag_ids is None:
+            if len(predict_dataset) == 0:
+                # NOTE: データサイズが0の場合はスキップ
+                # (例: 入力のENEs内のカテゴリが全て訓練データに存在せず推論不要と判断された場合)
+                continue
+        
+            predict_dataloader = DataLoader(
+                predict_dataset,
+                collate_fn=data_collator,
+                batch_size=args.per_device_predict_batch_size,
+                num_workers=args.num_workers,
+            )
+
+            model, predict_dataloader = accelerator.prepare(
+                model, predict_dataloader,
+            )
+
+            model.eval()
+            map_window_key_to_prediction = OrderedDict()
+            # 推論した結果を page_id と ENE と window_id で紐付ける
+            for step, batch in enumerate(tqdm(
+                predict_dataloader,
+                desc='Feeding for prediction',
+                leave=False,
+            )):
+                page_ids = batch['page_id']
+                window_ids = batch['window_id']
+                enes = batch['ENE']
+                with torch.no_grad():
+                    outputs = model(
+                        input_ids = batch['input_ids'],
+                        attention_mask = batch.get('attention_mask'),
+                        token_type_ids = batch.get('token_type_ids'),
+                        decode=True,
+                    )
+                #predictions = outputs.logits.argmax(dim=-1)
+                predictions = outputs['decoded']
+                page_ids_gathered, window_ids_gathered, predictions_gathered = \
+                    accelerator.gather([page_ids, window_ids, predictions])
+                page_ids = page_ids_gathered
+                window_ids = window_ids_gathered
+                predictions = predictions_gathered.detach().cpu().clone().numpy()
+                predictions = predictions.transpose(0, 2, 1) # [B, L, A] -> [B, A, L]
+                predictions = predictions[:, :, 1:] # 1トークン目はCLSなので除去
+                for page_id, window_id, ene, pred in zip(
+                    page_ids, window_ids, enes, predictions
+                ):
+                    # 推論の必要の無い属性名は None にしてメモリと計算量の節約
+                    attribute_id_counter = mapping.map_ene_to_attribute_id_counter[ene]
+                    pred_list = [
+                        None if attribute_id not in attribute_id_counter
+                        else p.astype(np.int8)
+                        for attribute_id, p in enumerate(pred)
+                    ]
+                    key = (page_id, ene, window_id)
+                    map_window_key_to_prediction[key] = pred_list
+
+            # page_id と ENE と window_id と推論結果を元に
+            # page_id と ENE に推論結果を集約
+            map_page_key_to_predictions = OrderedDict()
+            def merge_predictions(example):
+                page_id = example['page_id']
+                ene = example['ENE']
+                window_id = example['window_id']
+                window_key = (page_id, ene, window_id)
+                #prediction = map_page_id_and_window_id_to_prediction.get(
+                prediction = map_window_key_to_prediction.get(
+                    (page_id, window_id)
+                )
+                if prediction is None:
+                    return
+                example['prediction'] = prediction
+                page_key = (page_id, ene)
+                map_page_key_to_predictions.setdefault(page_key, []).append(example)
+            predict_dataset.map(
+                merge_predictions,
+                desc='Merging windowed predictions into pages',
+                load_from_cache_file=False,
+            )
+
+            # ウィンドウをマージしつつ推論結果を出力
+            with open(args.predict_output_jsonl, 'w', encoding='utf-8') as f:
+                for (page_id, ene), windows in tqdm(
+                    map_page_key_to_predictions.items(),
+                    desc='Extracting predicted attributes',
+                    leave=False,
+                ):
+                    tokens_with_offsets = []
+                    tag_ids = np.array([], dtype=np.int8).reshape(num_attribute_names, 0)
+                    # リスト・配列を拡張しながらウィンドウをマージ
+                    for window in windows:
+                        title = window['title']
+                        ene = window['ENE']
+                        window_start = window['window_id'] * (args.window_size - args.window_overlap_size)
+                        window_end = window_start + len(window['tokens'])
+                        if window_end > len(tokens_with_offsets):
+                            extension_length = window_end - len(tokens_with_offsets)
+                            tokens_with_offsets.extend([None] * extension_length)
+                            tag_ids_extension = np.zeros(
+                                [num_attribute_names, extension_length],
+                                dtype=np.int8
+                            )
+                            tag_ids = np.concatenate([tag_ids, tag_ids_extension], axis=1)
+                        for i, token_with_offset in enumerate(window['tokens_with_offsets']):
+                            tokens_with_offsets[window_start+i] = token_with_offset
+                        for attribute_index, attribute_tag_ids in enumerate(window['prediction']):
+                            if attribute_tag_ids is None:
+                                continue
+                            for i, tag_id in enumerate(attribute_tag_ids):
+                                if i >= len(window['tokens']):
+                                    break
+                                tag = mapping.tag_list[tag_id]
+                                if tag in ['B', 'I']:
+                                    previous_tag_id = tag_ids[attribute_index, window_start+i]
+                                    previous_tag = mapping.tag_list[previous_tag_id]
+                                    if previous_tag == 'O':
+                                        tag_ids[attribute_index, window_start+i] = tag_id
+                    html_path = os.path.join(args.predict_html_dir, f'{page_id}.html')
+                    with open(html_path, 'r', encoding='utf-8') as f_html:
+                        html_lines = f_html.read().splitlines(keepends=True)
+                    attribute_id_counter = mapping.map_ene_to_attribute_id_counter[ene]
+                    for attribute_index, attribute_tag_ids in enumerate(tag_ids):
+                        attribute_name = mapping.attribute_names[attribute_index]
+                        if attribute_index not in attribute_id_counter:
                             continue
-                        #attribute_name = mapping.attribute_names[attribute_index]
-                        #if attribute_name not in attribute_name_counter:
-                        #    continue
+                        found_b = False
+                        offsets = {}
                         for i, tag_id in enumerate(attribute_tag_ids):
-                            if i >= len(window['tokens']):
-                                break
                             tag = mapping.tag_list[tag_id]
-                            if tag in ['B', 'I']:
-                                previous_tag_id = tag_ids[attribute_index, window_start+i]
-                                previous_tag = mapping.tag_list[previous_tag_id]
-                                if previous_tag == 'O':
-                                    tag_ids[attribute_index, window_start+i] = tag_id
-                html_path = os.path.join(args.predict_html_dir, f'{page_id}.html')
-                with open(html_path, 'r', encoding='utf-8') as f_html:
-                    html_lines = f_html.read().splitlines(keepends=True)
-                #attribute_name_counter = mapping.map_ene_to_attribute_name_counter[ene]
-                attribute_id_counter = mapping.map_ene_to_attribute_id_counter[ene]
-                #attribute_name_counter = mapping.map_ene_to_attribute_name_counter.get(ene)
-                #if attribute_name_counter is None:
-                #    continue
-                for attribute_index, attribute_tag_ids in enumerate(tag_ids):
-                    attribute_name = mapping.attribute_names[attribute_index]
-                    #if attribute_name not in attribute_name_counter:
-                    #    continue
-                    if attribute_index not in attribute_id_counter:
-                        continue
-                    found_b = False
-                    offsets = {}
-                    for i, tag_id in enumerate(attribute_tag_ids):
-                        tag = mapping.tag_list[tag_id]
-                        token_with_offsets = tokens_with_offsets[i]
-                        if tag == 'B':
-                            if found_b:
-                                extract(f, html_lines, offsets)
-                            #logger.debug('B tag')
-                            found_b = True
-                            offsets['start_line'] = token_with_offsets["start_line"]
-                            offsets['start_offset'] = token_with_offsets["start_offset"]
-                            offsets['end_line'] = token_with_offsets["end_line"]
-                            offsets['end_offset'] = token_with_offsets["end_offset"]
-                        if tag == 'I':
-                            offsets['end_line'] = token_with_offsets["end_line"]
-                            offsets['end_offset'] = token_with_offsets["end_offset"]
-                        if tag == 'O':
-                            if found_b:
-                                found_b = False
-                                extract(f, html_lines, offsets)
-                    if found_b:
-                        extract(f, html_lines, offsets)
+                            token_with_offsets = tokens_with_offsets[i]
+                            if tag == 'B':
+                                if found_b:
+                                    extract(f, html_lines, offsets)
+                                #logger.debug('B tag')
+                                found_b = True
+                                offsets['start_line'] = token_with_offsets["start_line"]
+                                offsets['start_offset'] = token_with_offsets["start_offset"]
+                                offsets['end_line'] = token_with_offsets["end_line"]
+                                offsets['end_offset'] = token_with_offsets["end_offset"]
+                            if tag == 'I':
+                                offsets['end_line'] = token_with_offsets["end_line"]
+                                offsets['end_offset'] = token_with_offsets["end_offset"]
+                            if tag == 'O':
+                                if found_b:
+                                    found_b = False
+                                    extract(f, html_lines, offsets)
+                        if found_b:
+                            extract(f, html_lines, offsets)
 
 if __name__ == '__main__':
     main()
