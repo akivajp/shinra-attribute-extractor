@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import argparse
+import asyncio
 import json
 import math
 import os
@@ -342,7 +343,7 @@ def parse_args():
 
     return args
 
-def main():
+async def main():
     args = parse_args() 
     logger.debug('args: %s', args)
 
@@ -625,18 +626,6 @@ def main():
         y_true = y_true.transpose(0, 2, 1).reshape(batch_size*num_attribute_names, seq_len)
         # [B, L, A] -> [A, B, L]
 
-        # Remove ignored index (special tokens)
-        #true_predictions = [
-        #    [tag_list[p] for (p, l) in zip(pred, gold_label) if l != -100]
-        #    for pred, gold_label in zip(y_pred, y_true)
-        #    if gold_label[1] != -100
-        #]
-        #true_labels = [
-        #    [tag_list[l] for (p, l) in zip(pred, gold_label) if l != -100]
-        #    for pred, gold_label in zip(y_pred, y_true)
-        #    if gold_label[1] != -100
-        #]
-        #return true_predictions, true_labels
         true_pred = []
         true_labels = []
         for pred, gold_label in zip(y_pred, y_true):
@@ -991,8 +980,6 @@ def main():
             load_from_cache_file = True,
         )
 
-        hash = datasets.fingerprint.Hasher.hash
-
         window_size = args.window_size
         window_overlap_size = args.window_overlap_size
         per_device_predict_batch_size = args.per_device_predict_batch_size
@@ -1017,33 +1004,54 @@ def main():
             return datasets.Dataset.from_list(extracted).to_dict()
 
         # NOTE: verbosity が warning 以下だとcache loading logが過剰に出て煩わしい
-        #datasets.logging.set_verbosity_error()
+        datasets.logging.set_verbosity_error()
 
+        async def extract(dataset):
+            # データセットから args.predict_chunk_size 件ずつ取り出して推論
+            extracted = dataset.map(
+                map_predict,
+                batched = True,
+                remove_columns = filtered_dataset.column_names,
+                desc = 'Predicting chunk',
+                load_from_cache_file = True,
+                batch_size = args.predict_chunk_size,
+                writer_batch_size = 1,
+                num_proc = 1,
+            )
+            return extracted
+
+        def blocking_write(f, extracted):
+            for record in extracted:
+                f.write(json.dumps(record, ensure_ascii=False))
+                f.write('\n')
+
+        #filtered_dataset = filtered_dataset.select(range(210))
+        
+        extracted = None
+        extract_batch_size = 1000
         with open(args.predict_output_jsonl, 'w', encoding='utf-8') as f:
             predict_dataset_size = len(filtered_dataset)
             for i in tqdm(
-                range(math.ceil(predict_dataset_size / args.predict_chunk_size)),
+                #range(math.ceil(predict_dataset_size / args.predict_chunk_size)),
+                range(math.ceil(predict_dataset_size / extract_batch_size)),
                 desc='Predicting all',
             ):
                 # データセットから args.predict_chunk_size 件ずつ取り出して推論
                 chunk = filtered_dataset.shard(
-                    math.ceil(predict_dataset_size / args.predict_chunk_size),
+                    #math.ceil(predict_dataset_size / args.predict_chunk_size),
+                    math.ceil(predict_dataset_size / extract_batch_size),
                     i,
                     contiguous=True,
                 )
-                extracted = chunk.map(
-                    map_predict,
-                    batched = True,
-                    remove_columns = filtered_dataset.column_names,
-                    desc = 'Predicting chunk',
-                    load_from_cache_file = True,
-                    batch_size = args.predict_chunk_size,
-                    writer_batch_size = 1,
-                    num_proc = 1,
-                )
-                for record in extracted:
-                    f.write(json.dumps(record, ensure_ascii=False))
-                    f.write('\n')
+                if extracted is None:
+                    extracted = await extract(chunk)
+                else:
+                    co_write = asyncio.to_thread(blocking_write, f, extracted)
+                    extracted = await extract(chunk)
+                    await co_write
+            if extracted:
+                blocking_write(f, extracted)
 
 if __name__ == '__main__':
-    main()
+    #await main()
+    asyncio.run(main())

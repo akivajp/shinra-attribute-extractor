@@ -122,7 +122,11 @@ def tokenize(
     tokenizer: PreTrainedTokenizer,
 ):
     def _tokenize(example):
-        tokens_with_offsets = tokenize_with_offsets(tokenizer, example['context_html'])
+        try:
+            tokens_with_offsets = tokenize_with_offsets(tokenizer, example['context_html'])
+        except Exception as e:
+            logger.error('failed to tokenize: %s', example['page_id'])
+            raise e
         tokens = [token.text for token in tokens_with_offsets]
         return {
             'tokens': tokens,
