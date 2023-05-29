@@ -43,6 +43,10 @@ from preprocess import (
     prepare_for_prediction,
 )
 
+from prediction import (
+    predict,
+)
+
 from model import (
     TokenMultiClassificationModel,
 )
@@ -529,6 +533,7 @@ def main():
     # Use the device given by the `accelerator` object.
     device = accelerator.device
     model.to(device)
+    #model_acc.to(device)
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -549,9 +554,21 @@ def main():
         lr_scheduler = None
 
     # Prepare everything with our `accelerator`.
-    model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
+    #train_dataloader = accelerator.prepare(train_dataloader)
+    #model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
+    model_acc, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, eval_dataloader, lr_scheduler,
     )
+    #if args.do_train:
+    #    #model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
+    #    #    model, optimizer, train_dataloader, eval_dataloader, lr_scheduler,
+    #    #)
+    #    pass
+    #else:
+    #    #model, optimizer, lr_scheduler = accelerator.prepare(
+    #    #    model, optimizer, lr_scheduler,
+    #    #)
+    #    pass
 
     # We need to recalculate our total training steps as the size of the training dataloader
     # may have changed.
@@ -696,7 +713,8 @@ def main():
             json.dump(status, f, indent=2, sort_keys=True, ensure_ascii=False)
 
     def do_eval():
-        model.eval()
+        #model.eval()
+        model_acc.eval()
         samples_seen = 0
         #for step, batch in enumerate(eval_dataloader):
         for step, batch in enumerate(tqdm(
@@ -708,7 +726,8 @@ def main():
                 #logger.debug('model.device: %s', model.device)
                 #logger.debug('batch input_ids device: %s', batch['input_ids'].device)
                 #logger.debug('batch tag_ids device: %s', batch['tag_ids'].device)
-                outputs = model(
+                #outputs = model(
+                outputs = model_acc(
                     input_ids = batch['input_ids'],
                     tag_ids = batch['tag_ids'],
                     attention_mask = batch.get('attention_mask'),
@@ -758,44 +777,6 @@ def main():
             status_path = os.path.join(output_dir, 'status.json')
             with open(status_path, "w", encoding='utf-8') as f:
                 json.dump(status, f, indent=2, sort_keys=True, ensure_ascii=False)
-
-    def extract(f_out, html_lines, offsets, entity_scores):
-        text = ''
-        start_line = offsets['start_line']
-        start_offset = offsets['start_offset']
-        end_line = offsets['end_line']
-        end_offset = offsets['end_offset']
-        for line_index in range(start_line, end_line+1):
-            if start_line == end_line:
-                line = html_lines[line_index][start_offset:end_offset]
-            # (start_line < end_line)
-            elif line_index == start_line:
-                line = html_lines[line_index][start_offset:]
-            elif line_index == end_line:
-                line = html_lines[line_index][:end_offset]
-            else:
-                line = html_lines[line_index]
-            text += line
-        data = {}
-        data['page_id'] = page_id
-        data['title'] = title
-        data['ENE'] = ene
-        data['attribute'] = attribute_name
-        data['html_offset'] = {
-            'start': {
-                'line_id': start_line,
-                'offset': start_offset,
-            },
-            'end': {
-                'line_id': end_line,
-                'offset': end_offset,
-            },
-            'text': text,
-        }
-        # 単純平均でスコアを算出
-        data['score'] = sum(entity_scores) / len(entity_scores)
-        f_out.write(json.dumps(data, ensure_ascii=False))
-        f_out.write('\n')
 
     if args.do_train:
         # Train!
@@ -848,7 +829,6 @@ def main():
         #        raise ValueError(f'Failed to parse training_difference: {training_difference}')
         logger.debug('starting_epoch: %d', starting_epoch)
         logger.debug('resume_step: %d', resume_step)
-
         
         #for epoch in range(starting_epoch, args.num_train_epochs):
         for epoch in range(0, args.num_train_epochs):
@@ -881,9 +861,11 @@ def main():
                             skip_collation = True
                         continue
                 resuming = False
-                model.train()
+                #model.train()
+                model_acc.train()
                 #outputs = model(**batch)
-                outputs = model(
+                #outputs = model(
+                outputs = model_acc(
                     input_ids = batch['input_ids'],
                     tag_ids = batch['tag_ids'],
                     attention_mask = batch.get('attention_mask'),
@@ -963,7 +945,8 @@ def main():
         if args.output_dir is not None:
             if eval_metric is not None:
                 accelerator.wait_for_everyone()
-                unwrapped_model = accelerator.unwrap_model(model)
+                #unwrapped_model = accelerator.unwrap_model(model)
+                unwrapped_model = accelerator.unwrap_model(model_acc)
                 unwrapped_model.save_pretrained(
                     args.output_dir,
                     is_main_process=accelerator.is_main_process,
@@ -993,14 +976,48 @@ def main():
         logger.info("  Num examples = %d", len(raw_predict_dataset))
         logger.info("  Instantaneous batch size per device = %d", args.per_device_eval_batch_size)
 
+        # NOTE: 超重要
+        # datasets.map実行前にやっておかないとキャッシュが正常に効かない
+        model.eval()
+
+        predict_html_dir = args.predict_html_dir
         def filter_page_id_with_html(example):
             page_id = example['page_id']
-            html_path = os.path.join(args.predict_html_dir, page_id + '.html')
+            html_path = os.path.join(predict_html_dir, page_id + '.html')
             return os.path.isfile(html_path)
         filtered_dataset = raw_predict_dataset.filter(
             filter_page_id_with_html,
             desc = 'Filtering page_id with html',
+            load_from_cache_file = True,
         )
+
+        hash = datasets.fingerprint.Hasher.hash
+
+        window_size = args.window_size
+        window_overlap_size = args.window_overlap_size
+        per_device_predict_batch_size = args.per_device_predict_batch_size
+        num_workers = args.num_workers
+        def map_predict(batch):
+            dataset = datasets.Dataset.from_dict(batch)
+            #logger.debug('hash dataset: %s', hash(dataset))
+            extracted = predict(
+                dataset,
+                html_dir = predict_html_dir,
+                mapping = mapping,
+                model = model,
+                tokenizer = tokenizer,
+                window_size = window_size,
+                window_overlap_size = window_overlap_size,
+                data_collator = data_collator,
+                per_device_predict_batch_size = per_device_predict_batch_size,
+                load_from_cache_file = True,
+                num_workers = num_workers,
+            )
+            #logger.debug('hash extracted: %s', hash(extracted))
+            return datasets.Dataset.from_list(extracted).to_dict()
+
+        # NOTE: verbosity が warning 以下だとcache loading logが過剰に出て煩わしい
+        #datasets.logging.set_verbosity_error()
 
         with open(args.predict_output_jsonl, 'w', encoding='utf-8') as f:
             predict_dataset_size = len(filtered_dataset)
@@ -1008,193 +1025,25 @@ def main():
                 range(math.ceil(predict_dataset_size / args.predict_chunk_size)),
                 desc='Predicting all',
             ):
-                # データセットから1件ずつ取り出して推論
+                # データセットから args.predict_chunk_size 件ずつ取り出して推論
                 chunk = filtered_dataset.shard(
                     math.ceil(predict_dataset_size / args.predict_chunk_size),
                     i,
                     contiguous=True,
                 )
-                predict_dataset = prepare_for_prediction(
-                    chunk,
-                    args.predict_html_dir,
-                    mapping,
-                    tokenizer,
-                    num_workers = 1,
-                    window_size = args.window_size,
-                    window_overlap_size = args.window_overlap_size,
+                extracted = chunk.map(
+                    map_predict,
+                    batched = True,
+                    remove_columns = filtered_dataset.column_names,
+                    desc = 'Predicting chunk',
+                    load_from_cache_file = True,
+                    batch_size = args.predict_chunk_size,
+                    writer_batch_size = 1,
+                    num_proc = 1,
                 )
-                #logger.debug('predict_dataset: %s', predict_dataset)
-
-                if len(predict_dataset) == 0:
-                    # NOTE: データサイズが0の場合はスキップ
-                    # (例: 入力のENEs内のカテゴリが全て訓練データに存在せず推論不要と判断された場合)
-                    continue
-            
-                predict_dataloader = DataLoader(
-                    predict_dataset,
-                    collate_fn=data_collator,
-                    batch_size=args.per_device_predict_batch_size,
-                    num_workers=args.num_workers,
-                )
-
-                model, predict_dataloader = accelerator.prepare(
-                    model, predict_dataloader,
-                )
-
-                model.eval()
-                map_window_key_to_prediction = OrderedDict()
-                # 推論した結果を page_id と ENE と window_id で紐付ける
-                for step, batch in enumerate(tqdm(
-                    predict_dataloader,
-                    desc='Feeding for prediction',
-                    leave=False,
-                )):
-                    page_ids = batch['page_id']
-                    window_ids = batch['window_id']
-                    enes = batch['ENE']
-                    with torch.no_grad():
-                        outputs = model(
-                            input_ids = batch['input_ids'],
-                            attention_mask = batch.get('attention_mask'),
-                            token_type_ids = batch.get('token_type_ids'),
-                            decode=True,
-                        )
-                    #predictions = outputs.logits.argmax(dim=-1)
-                    predictions = outputs['decoded']
-                    extended_scores = outputs['scores']
-                    [
-                        page_ids_gathered,
-                        window_ids_gathered,
-                        predictions_gathered,
-                        scores_gathered
-                    ] = \
-                        accelerator.gather([page_ids, window_ids, predictions, extended_scores])
-                    page_ids = page_ids_gathered
-                    window_ids = window_ids_gathered
-                    predictions = predictions_gathered.detach().cpu().clone().numpy()
-                    predictions = predictions.transpose(0, 2, 1) # [B, L, A] -> [B, A, L]
-                    predictions = predictions[:, :, 1:] # 1トークン目はCLSなので除去
-                    extended_scores = scores_gathered.detach().cpu().clone().numpy()
-                    extended_scores = extended_scores.transpose(0, 2, 1) # [B, L, A] -> [B, A, L]
-                    extended_scores = extended_scores[:, :, 1:] # 1トークン目はCLSなので除去
-                    for page_id, window_id, ene, pred, extended_scores in zip(
-                        page_ids, window_ids, enes, predictions, extended_scores,
-                    ):
-                        # 推論の必要の無い属性名は None にしてメモリと計算量の節約
-                        attribute_id_counter = mapping.map_ene_to_attribute_id_counter[ene]
-                        pred_list = [
-                            None if attribute_id not in attribute_id_counter
-                            else p.astype(np.int8)
-                            for attribute_id, p in enumerate(pred)
-                        ]
-                        key = (page_id, ene, window_id)
-                        #map_window_key_to_prediction[key] = pred_list
-                        map_window_key_to_prediction[key] = [pred_list, extended_scores]
-
-                # page_id と ENE と window_id と推論結果を元に
-                # page_id と ENE に推論結果を集約
-                map_page_key_to_predictions = OrderedDict()
-                def merge_predictions(example):
-                    page_id = example['page_id']
-                    ene = example['ENE']
-                    window_id = example['window_id']
-                    window_key = (page_id, ene, window_id)
-                    prediction = map_window_key_to_prediction.get(window_key)
-                    if prediction is None:
-                        return
-                    #example['prediction'] = prediction
-                    example['prediction'] = prediction[0]
-                    example['scores'] = prediction[1]
-                    page_key = (page_id, ene)
-                    map_page_key_to_predictions.setdefault(page_key, []).append(example)
-                predict_dataset.map(
-                    merge_predictions,
-                    desc='Merging windowed predictions into pages',
-                    load_from_cache_file=False,
-                )
-
-                # ウィンドウをマージしつつ推論結果を出力
-                for (page_id, ene), windows in tqdm(
-                    map_page_key_to_predictions.items(),
-                    desc='Extracting predicted attributes',
-                    leave=False,
-                ):
-                    tokens_with_offsets = []
-                    tag_ids = np.array([], dtype=np.int8).reshape(num_attribute_names, 0)
-                    extended_scores = np.array([], dtype=np.float32).reshape(num_attribute_names, 0)
-                    # リスト・配列を拡張しながらウィンドウをマージ
-                    for window in windows:
-                        title = window['title']
-                        ene = window['ENE']
-                        window_start = window['window_id'] * (args.window_size - args.window_overlap_size)
-                        window_end = window_start + len(window['tokens'])
-                        if window_end > len(tokens_with_offsets):
-                            extension_length = window_end - len(tokens_with_offsets)
-                            tokens_with_offsets.extend([None] * extension_length)
-                            tag_ids_extension = np.zeros(
-                                [num_attribute_names, extension_length],
-                                dtype=np.int8
-                            )
-                            scores_extension = np.zeros(
-                                [num_attribute_names, extension_length],
-                                dtype=np.float32
-                            )
-                            tag_ids = np.concatenate([tag_ids, tag_ids_extension], axis=1)
-                            extended_scores = np.concatenate([extended_scores, scores_extension], axis=1)
-                        for i, token_with_offset in enumerate(window['tokens_with_offsets']):
-                            tokens_with_offsets[window_start+i] = token_with_offset
-                        for attribute_index, attribute_tag_ids in enumerate(window['prediction']):
-                            #scores = window['scores'][attribute_index]
-                            if attribute_tag_ids is None:
-                                continue
-                            for i, tag_id in enumerate(attribute_tag_ids):
-                                if i >= len(window['tokens']):
-                                    break
-                                tag = mapping.tag_list[tag_id]
-                                score = window['scores'][attribute_index][i]
-                                if tag in ['B', 'I']:
-                                    previous_tag_id = tag_ids[attribute_index, window_start+i]
-                                    previous_tag = mapping.tag_list[previous_tag_id]
-                                    if previous_tag == 'O':
-                                        tag_ids[attribute_index, window_start+i] = tag_id
-                                        extended_scores[attribute_index, window_start+i] = score
-                    html_path = os.path.join(args.predict_html_dir, f'{page_id}.html')
-                    with open(html_path, 'r', encoding='utf-8') as f_html:
-                        html_lines = f_html.read().splitlines(keepends=True)
-                    attribute_id_counter = mapping.map_ene_to_attribute_id_counter[ene]
-                    for attribute_index, attribute_tag_ids in enumerate(tag_ids):
-                        attribute_name = mapping.attribute_names[attribute_index]
-                        if attribute_index not in attribute_id_counter:
-                            continue
-                        scores = extended_scores[attribute_index]
-                        entity_scores = []
-                        found_b = False
-                        offsets = {}
-                        for i, tag_id in enumerate(attribute_tag_ids):
-                            score = scores[i]
-                            tag = mapping.tag_list[tag_id]
-                            token_with_offsets = tokens_with_offsets[i]
-                            if tag == 'B':
-                                if found_b:
-                                    extract(f, html_lines, offsets, entity_scores)
-                                #logger.debug('B tag')
-                                found_b = True
-                                offsets['start_line'] = token_with_offsets["start_line"]
-                                offsets['start_offset'] = token_with_offsets["start_offset"]
-                                offsets['end_line'] = token_with_offsets["end_line"]
-                                offsets['end_offset'] = token_with_offsets["end_offset"]
-                                entity_scores = [score]
-                            if tag == 'I':
-                                offsets['end_line'] = token_with_offsets["end_line"]
-                                offsets['end_offset'] = token_with_offsets["end_offset"]
-                                entity_scores.append(score)
-                            if tag == 'O':
-                                if found_b:
-                                    found_b = False
-                                    extract(f, html_lines, offsets, entity_scores)
-                                entity_scores = []
-                        if found_b:
-                            extract(f, html_lines, offsets, entity_scores)
+                for record in extracted:
+                    f.write(json.dumps(record, ensure_ascii=False))
+                    f.write('\n')
 
 if __name__ == '__main__':
     main()

@@ -499,6 +499,7 @@ def prepare_for_prediction(
     num_workers = None,
     window_size = 510,
     window_overlap_size = 128,
+    load_from_cache_file = False,
 ):
     #logger.debug('loading from %s', input_jsonl_path)
     #dataset = load_dataset('json', data_files={'predict': input_jsonl_path})
@@ -509,7 +510,7 @@ def prepare_for_prediction(
         desc='Converting ENE predicts to ENE list',
         batched=True,
         num_proc=num_workers,
-        load_from_cache_file=False,
+        load_from_cache_file=load_from_cache_file,
     )
     #logger.debug('dataset: %s', dataset)
 
@@ -526,14 +527,14 @@ def prepare_for_prediction(
         batched=True,
         num_proc=num_workers,
         remove_columns=dataset.column_names,
-        load_from_cache_file=False,
+        load_from_cache_file=load_from_cache_file,
     )
     #logger.debug('dataset: %s', dataset)
 
     dataset = dataset.filter(
         filter_by_ene(mapping.map_ene_to_attribute_name_counter),
         desc='Filtering by ENE',
-        load_from_cache_file=False,
+        load_from_cache_file=load_from_cache_file,
     )
 
     dataset = dataset.map(
@@ -541,7 +542,7 @@ def prepare_for_prediction(
         desc='Loading HTML files',
         batched=True,
         num_proc=num_workers,
-        load_from_cache_file=False,
+        load_from_cache_file=load_from_cache_file,
     )
     #logger.debug('dataset: %s', dataset)
 
@@ -552,7 +553,7 @@ def prepare_for_prediction(
         batch_size=10,
         writer_batch_size=10,
         num_proc=num_workers,
-        load_from_cache_file=False,
+        load_from_cache_file=load_from_cache_file,
     )
     #logger.debug('dataset: %s', dataset)
 
@@ -570,7 +571,7 @@ def prepare_for_prediction(
         batch_size=10,
         writer_batch_size=10,
         num_proc=num_workers,
-        load_from_cache_file=False,
+        load_from_cache_file=load_from_cache_file,
     )
     #logger.debug('dataset: %s', dataset)
 
@@ -593,7 +594,7 @@ def prepare_for_prediction(
         batch_size=10,
         writer_batch_size=10,
         num_proc=num_workers,
-        load_from_cache_file=False,
+        load_from_cache_file=load_from_cache_file,
     )
     #logger.debug('dataset: %s', dataset)
 
@@ -612,7 +613,7 @@ def prepare_for_prediction(
         batch_size=10,
         writer_batch_size=10,
         num_proc=num_workers,
-        load_from_cache_file=False,
+        load_from_cache_file=load_from_cache_file,
     )
     #logger.debug('dataset: %s', dataset)
 
