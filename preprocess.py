@@ -83,6 +83,10 @@ def convert_example_mapper_to_batch_mapper(
     '''
     def batch_mapper(batch):
         map_key_to_list_features = None
+        if return_keys:
+            map_key_to_list_features = {
+                key: [] for key in return_keys
+            }
         #for sample in slice_batch_from_keys(batch, keys):
         #for mapped in slice_batch_from_keys(batch, keys):
         for example in slice_batch_from_keys(batch, keys):
@@ -100,16 +104,11 @@ def convert_example_mapper_to_batch_mapper(
                 raise ValueError(f'mapped is not dict or list: {mapped}')
             for mapped_example in mapped_examples:
                 if map_key_to_list_features is None:
-                    if return_keys:
-                        map_key_to_list_features = {
-                            key: [] for key in return_keys
-                        }
-                    else:
-                        # 最初に取得したサンプルの特徴量名一覧を元に
-                        # Dict[str, list] を用意する
-                        map_key_to_list_features = {
-                            key: [] for key in mapped_example.keys()
-                        }
+                    # 最初に取得したサンプルの特徴量名一覧を元に
+                    # Dict[str, list] を用意する
+                    map_key_to_list_features = {
+                        key: [] for key in mapped_example.keys()
+                    }
                 for key, feature in mapped_example.items():
                     map_key_to_list_features[key].append(feature)
         return map_key_to_list_features
