@@ -309,7 +309,8 @@ def parse_args():
     parser.add_argument(
         "--predict_chunk_size",
         type=int,
-        default=10,
+        #default=10,
+        default=100,
         help=(
             "The number of pages to be processed at once."
         )
@@ -1007,7 +1008,6 @@ async def main():
         datasets.logging.set_verbosity_error()
 
         async def extract(dataset):
-            # データセットから args.predict_chunk_size 件ずつ取り出して推論
             extracted = dataset.map(
                 map_predict,
                 batched = True,
@@ -1025,7 +1025,7 @@ async def main():
                 f.write(json.dumps(record, ensure_ascii=False))
                 f.write('\n')
 
-        #filtered_dataset = filtered_dataset.select(range(210))
+        #filtered_dataset = filtered_dataset.select(range(100))
         
         extracted = None
         #extract_batch_size = 10
@@ -1039,7 +1039,6 @@ async def main():
             ):
                 # データセットから args.predict_chunk_size 件ずつ取り出して推論
                 chunk = filtered_dataset.shard(
-                    #math.ceil(predict_dataset_size / args.predict_chunk_size),
                     math.ceil(predict_dataset_size / extract_batch_size),
                     i,
                     contiguous=True,
