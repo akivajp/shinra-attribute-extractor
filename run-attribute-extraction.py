@@ -103,6 +103,7 @@ def parse_args():
     parser.add_argument(
         "--model_name_or_path",
         type=str,
+        default='cl-tohoku/bert-base-japanese-v2',
         help="Path to pretrained model or model identifier from huggingface.co/models.",
         required=False,
     )
@@ -1024,6 +1025,7 @@ async def main():
             for record in extracted:
                 f.write(json.dumps(record, ensure_ascii=False))
                 f.write('\n')
+            f.flush()
 
         #filtered_dataset = filtered_dataset.select(range(100))
         
