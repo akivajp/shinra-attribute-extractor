@@ -200,8 +200,17 @@ def split_into_windows(
         for window_id, i in enumerate(
             range(0, len(tokens), window_size - window_overlap_size)
         ):
+            if omit_windows_without_entities:
+                for tag_list in tags:
+                    if tag_list is not None:
+                        # BタグまたはIタグが1つでもあれば採用
+                        if 'B' in tag_list[i : i+window_size]:
+                            break
+                        if 'I' in tag_list[i : i+window_size]:
+                            break
+                # Oタグのみの場合はスキップ
+                continue
             window_tokens = tokens[i : i+window_size]
-            #window_tags = [tag_list[i:i+args.window_size] for tag_list in tags]
             if tags is not None:
                 window_tags = [
                     tag_list[i : i+window_size] if tag_list is not None
