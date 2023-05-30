@@ -1028,6 +1028,7 @@ async def main():
         #filtered_dataset = filtered_dataset.select(range(210))
         
         extracted = None
+        #extract_batch_size = 10
         extract_batch_size = 1000
         with open(args.predict_output_jsonl, 'w', encoding='utf-8') as f:
             predict_dataset_size = len(filtered_dataset)
