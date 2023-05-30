@@ -75,6 +75,7 @@ def slice_batch_from_keys(
 def convert_example_mapper_to_batch_mapper(
     example_mapper: Callable[[Dict[str, Any]], Dict[str,Any]|List[Dict[str,Any]]],
     keys: Iterable[str],
+    return_keys: Iterable[str]|None = None,
 ):
     '''
     example_mapper (Iterable[Dict[str, Any]]) を
@@ -99,11 +100,16 @@ def convert_example_mapper_to_batch_mapper(
                 raise ValueError(f'mapped is not dict or list: {mapped}')
             for mapped_example in mapped_examples:
                 if map_key_to_list_features is None:
-                    # 最初に取得したサンプルの特徴量名一覧を元に
-                    # Dict[str, list] を用意する
-                    map_key_to_list_features = {
-                        key: [] for key in mapped_example.keys()
-                    }
+                    if return_keys:
+                        map_key_to_list_features = {
+                            key: [] for key in return_keys
+                        }
+                    else:
+                        # 最初に取得したサンプルの特徴量名一覧を元に
+                        # Dict[str, list] を用意する
+                        map_key_to_list_features = {
+                            key: [] for key in mapped_example.keys()
+                        }
                 for key, feature in mapped_example.items():
                     map_key_to_list_features[key].append(feature)
         return map_key_to_list_features
