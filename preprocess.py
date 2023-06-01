@@ -130,7 +130,7 @@ def tokenize(
         try:
             tokens_with_offsets = tokenize_with_offsets(tokenizer, example['context_html'])
         except Exception as e:
-            logger.error('failed to tokenize: %s', example['page_id'])
+            logger.error('failed to tokenize, page_id: %s', example['page_id'])
             raise e
         tokens = [token.text for token in tokens_with_offsets]
         return {
@@ -147,7 +147,12 @@ def tokenize_and_tag(
     map_ene_to_attribute_name_counter: Dict[str, Dict[str, int]],
 ):
     def _tokenize_and_tag(example):
-        tokens_with_offsets = tokenize_with_offsets(tokenizer, example['context_html'])
+        try:
+            #logger.warning('page_id: %s', example['page_id'])
+            tokens_with_offsets = tokenize_with_offsets(tokenizer, example['context_html'])
+        except Exception as e:
+            logger.error('failed to tokenize, page_id: %s', example['page_id'])
+            raise e
         tokens = [token.text for token in tokens_with_offsets]
         tags, num_tagged, num_skipped = tag_tokens_with_annotation_list(
             tokens_with_offsets,
@@ -158,11 +163,6 @@ def tokenize_and_tag(
                 )
             ]
         )
-        #extended_tags = [
-        #    ' ' * len(tokens)
-        #    for _ in range(len(attribute_names))
-        #]
-        #extended_tags = [None] * num_attribute_names
         extended_tags = [None] * len(map_attribute_name_to_id)
         ene = example['ENE']
         attribute_name_counter = map_ene_to_attribute_name_counter[ene]
@@ -345,6 +345,7 @@ def preprocess_for_training(
                 map_ene_to_attribute_name_counter,
             ),
             [
+                'page_id',
                 'context_html',
                 'attributes.attribute',
                 'attributes.html_offset',
@@ -381,7 +382,6 @@ def preprocess_for_training(
             ), [
                 'page_id',
                 'title',
-                #'category_name',
                 'ENE',
                 'tokens',
                 'tags',
@@ -581,6 +581,7 @@ def prepare_for_prediction(
                 tokenizer,
             ),
             [
+                'page_id',
                 'context_html',
             ]
         ),

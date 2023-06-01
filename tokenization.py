@@ -41,8 +41,8 @@ def normalize(text):
 
 def merge_tokens(tokens: list[TokenWithOffset]):
     # トークンを結合して文字列を生成する
-    #return str.join('', [token.text for token in tokens])
-    return normalize( str.join('', [token.text for token in tokens]) )
+    #return normalize( str.join('', [token.text for token in tokens]) )
+    return str.join('', [token.text for token in tokens])
 
 def decompose_line(line, line_index):
     # ライン文字列を構成文字単位でトークナイズする
@@ -78,6 +78,7 @@ def log_error_info(
     merged = None,
     tokens = None,
     token_index = None,
+    traceable_tokens = None,
     word_index = None,
     words = None,
 ):
@@ -92,10 +93,11 @@ def log_error_info(
     logger.error('char_index: %s', char_index)
     logger.error('word: %s', word)
     if word is not None:
+        logger.error('word_index: %s', word_index)
         for i, c in enumerate(word):
             logger.error('word[%s]: %s', i, c)
             logger.error('word[%s] name: %s', i, unicodedata.name(c))
-        logger.error('words digest: %s', words[word_index-5:word_index+5])
+        logger.error('words digest: %s', words[word_index-5:word_index+6])
     if token is not None:
         for i, c in enumerate(token):
             logger.error('token[%s]: %s', i, c)
@@ -110,8 +112,13 @@ def log_error_info(
         for o in range(char_index-2, char_index+3):
             if o >= 0 and o < len(line_chars):
                 logger.error('line character %s: %s', o, line_chars[o])
+                name = unicodedata.name(line_chars[o].text)
+                logger.error('line character %s name: %s', o, name)
     if merged is not None:
         logger.error('merged: %s', merged)
+    if traceable_tokens is not None:
+        for i in range(-5, 0):
+            logger.error('traceable token %s: %s', i, traceable_tokens[i])
 
 def tokenize_with_offsets(
     tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast,
@@ -132,7 +139,7 @@ def tokenize_with_offsets(
         last_token = None
         unk_start_index = None
         for word_index, word in enumerate(words):
-            #logger.debug('word: %s', word)
+            #logger.debug('word %s: %s', word_index, word)
             tokens = tokenizer.subword_tokenizer.tokenize(word)
             if tokens == [tokenizer.unk_token]:
                 if len(word) >= 2:
@@ -145,6 +152,7 @@ def tokenize_with_offsets(
                         #tokens.extend(c)
                     #logger.debug('new tokens: %s', tokens)
             for token_index, token in enumerate(tokens):
+                #logger.debug('token %s: %s', token_index, token)
                 if token is tokenizer.unk_token:
                     if last_token is tokenizer.unk_token:
                         # 連続する UNK は1つの UNK とみなす
@@ -178,7 +186,11 @@ def tokenize_with_offsets(
                     # 次に、開始位置を狭めながら first_char が含まれなくなる位置を探す
                     # first_char が含まれない開始位置の1つ前が first_char の開始位置として適切
                     merged = merge_tokens(line_chars[char_index:test_end+1])
-                    if first_char in merged:
+                    normal_merged = normalize(merged)
+                    #if first_char == unicodedata.lookup('COMBINING ACUTE ACCENT'):
+                    #    logger.warning('merged: %s', merged)
+                    if first_char in merged or first_char in normal_merged:
+                        #logger.debug('found first char %s in merged: %s', first_char, merged)
                         # 開始位置の探索
                         for test_start in range(
                             char_index+1,
@@ -203,6 +215,7 @@ def tokenize_with_offsets(
                         line_index=line_index,
                         tokens=tokens,
                         token_index=token_index,
+                        traceable_tokens=traceable_tokens,
                         words=words,
                         word_index=word_index,
                     )
@@ -231,13 +244,15 @@ def tokenize_with_offsets(
                 merged = None
                 for test_end in range(char_index, len(line_chars)):
                     merged = merge_tokens(line_chars[char_index:test_end+1])
+                    normal_merged = normalize(merged)
                     #if DEBUG_MODE:
                     #    logger.debug('char_index: %s', char_index)
                     #    logger.debug('end_char_index: %s', end_char_index)
                     #    logger.debug('token: %s', token)
                     #    logger.debug('normal_token: %s', normal_token)
                     #    logger.debug('merged: %s', merged)
-                    if normal_token == merged:
+                    #if normal_token == merged:
+                    if normal_token == normal_merged:
                         matched = True
                         end_char_index = test_end
                         break
@@ -251,6 +266,7 @@ def tokenize_with_offsets(
                         merged=merged,
                         tokens=tokens,
                         token_index=token_index,
+                        traceable_tokens=traceable_tokens,
                         words=words,
                         word_index=word_index,
                     )
