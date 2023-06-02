@@ -199,7 +199,9 @@ def tokenize_with_offsets(
                             merged = merge_tokens(
                                 line_chars[test_start:test_end+1]
                             )
-                            if first_char not in merged:
+                            normal_merged = normalize(merged)
+                            #if first_char not in merged:
+                            if first_char not in merged and first_char not in normal_merged:
                                 first_char_start_index = test_start - 1
                                 found_first_char = True
                                 break
