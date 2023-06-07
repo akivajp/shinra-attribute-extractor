@@ -50,6 +50,7 @@ def log_error_info(
     token = get_index(tokens, token_index)
     logger.error('line_index: %s', line_index)
     logger.error('char_index: %s', char_index)
+    logger.error('token_index: %s', token_index)
     logger.error('word: %s', word)
     if word is not None:
         logger.error('word_index: %s', word_index)
@@ -63,18 +64,72 @@ def log_error_info(
             logger.error('token[%s] name: %s', i, unicodedata.name(c))
         kd_token = unicodedata.normalize('NFKD', token)
         for i, c in enumerate(kd_token):
-            logger.error('normal token[%s]: %s', i, c)
-            logger.error('normal token[%s] name: %s', i, unicodedata.name(c))
+            logger.error('kd token[%s]: %s', i, c)
+            logger.error('kd token[%s] name: %s', i, unicodedata.name(c))
         logger.error('words digest: %s', words[word_index-5:word_index+5])
     logger.error('tokens digest: %s', tokens[token_index-5:token_index+5])
     if line is not None and char_index is not None:
         logger.error('offset character: %s', line[char_index])
         name = unicodedata.name(line[char_index])
         logger.error('offset character name: %s', name)
-        logger.error('line digest: %s', line[char_index-5:char_index+5])
+        #logger.error('line digest: %s', line[char_index-5:char_index+5])
+        for i in range(-2, 3):
+            logger.error('char %s: %s', i, line[char_index+i])
+            logger.error('char %s name: %s', i, unicodedata.name(line[char_index+i]))
     if traceable_tokens is not None:
         for i in range(-5, 0):
             logger.error('traceable token %s: %s', i, traceable_tokens[i])
+
+def merge_tokens(
+    tokens: list[TokenWithOffset],
+):
+    
+    first_unk = tokens[0]
+    last_unk = tokens[-1]
+    traceable_token = TokenWithOffset(
+        text=''.join([t.text for t in tokens]),
+        start_line=first_unk.start_line,
+        start_offset=first_unk.start_offset,
+        end_line=last_unk.end_line,
+        end_offset=last_unk.end_offset,
+    )
+    return traceable_token
+
+def process_pended(
+    tokenizer: BertJapaneseTokenizer,
+    pending: list[str],
+    line_index: int,
+    start_offset: int,
+    end_offset: int,
+):
+    # NOTE: オフセット合わせできていなかったトークンの辻褄を合わせる
+    unk_list: list[TokenWithOffset] = []
+    traceable_tokens: list[TokenWithOffset] = []
+    for p in pending:
+        traceable_token = TokenWithOffset(
+            text=p,
+            start_line=line_index,
+            start_offset=start_offset,
+            end_line=line_index,
+            end_offset=end_offset,
+        )
+        if p not in tokenizer.subword_tokenizer.vocab:
+            # 連続する未知語は溜めておいて後で1つにまとめる
+            unk_list.append(traceable_token)
+            continue
+        # 既知のトークン
+        if len(unk_list) > 0:
+            # 先に溜めておいた未知語を1つのトークンにまとめる
+            traceable_tokens.append(merge_tokens(unk_list))
+            unk_list.clear()
+        # 既知のトークンを出力
+        traceable_tokens.append(traceable_token)
+    if len(unk_list) > 0:
+        # 残りの溜まっていた未知語を1つのトークンにまとめる
+        traceable_tokens.append(merge_tokens(unk_list))
+        unk_list.clear()
+    pending.clear()
+    return traceable_tokens
 
 def tokenize_with_offsets(
     tokenizer: BertJapaneseTokenizer,
@@ -104,6 +159,7 @@ def tokenize_with_offsets(
                 # word 単体が未知語であったため、文字単位に分解する
                 tokens = list(word)
             for token_index, token in enumerate(tokens):
+                # NOTE: この分解方法の場合、 token が UNK になることはないはず
                 #logger.debug('token %s: %s', token_index, token)
                 actual_token = token.strip()
                 if token_index >= 1:
@@ -124,10 +180,6 @@ def tokenize_with_offsets(
                         # 対策: pending に溜めておいて、有効な文字が出てきたら一気に処理する
                         pending.append(token)
                         continue
-                if token not in tokenizer.subword_tokenizer.vocab:
-                    # 未知語は後から辻褄合わせをする
-                    pending.append(token)
-                    continue
                 found_first_char = -1
                 # 最初の1文字を探す
                 for test_index in range(char_index, len(line)):
@@ -159,19 +211,13 @@ def tokenize_with_offsets(
                     raise ValueError(f'first char not found: {first_char}')
                 if len(pending) > 0:
                     # NOTE: オフセット合わせできていなかったトークンの辻褄を合わせる
-                    for p in pending:
-                        if first_char_start_index - char_index == 0:
-                            if p not in tokenizer.subword_tokenizer.vocab:
-                                # NOTE: 長さ0の未知語を出力する必用は無い
-                                continue
-                        traceable_token = TokenWithOffset(
-                            text=p,
-                            start_line=line_index,
-                            start_offset=char_index,
-                            end_line=line_index,
-                            end_offset=first_char_start_index,
-                        )
-                        traceable_tokens.append(traceable_token)
+                    traceable_tokens.extend(process_pended(
+                        tokenizer,
+                        pending,
+                        line_index,
+                        char_index,
+                        first_char_start_index,
+                    ))
                     pending.clear()
                 matched = False
                 for test_end in range(first_char_start_index+1, len(line)+1):
@@ -193,6 +239,9 @@ def tokenize_with_offsets(
                         next_char_index = test_end - 1
                         break
                 if not matched:
+                    logger.warning('word tokens: %s', tokens)
+                    logger.warning('word -1 tokens: %s', list(words[word_index-1]))
+
                     logger.error('token not found: %s', token)
                     log_error_info(
                         char_index=first_char_start_index,
@@ -216,20 +265,15 @@ def tokenize_with_offsets(
                 char_index = next_char_index
         if len(pending) > 0:
             # NOTE: オフセット合わせできていなかったトークンの辻褄を合わせる
-            for p in pending:
-                end_index = len(line)
-                if end_index - char_index == 0:
-                    if p not in tokenizer.subword_tokenizer:
-                        # NOTE: 長さ0の未知語を出力する必用は無い
-                        continue
-                traceable_token = TokenWithOffset(
-                    text=p,
-                    start_line=line_index,
-                    start_offset=char_index,
-                    end_line=line_index,
-                    end_offset=end_index,
-                )
-                traceable_tokens.append(traceable_token)
+            if len(pending) > 0:
+                # NOTE: オフセット合わせできていなかったトークンの辻褄を合わせる
+                traceable_tokens.extend(process_pended(
+                    tokenizer,
+                    pending,
+                    line_index,
+                    char_index,
+                    len(line),
+                ))
             pending.clear()
     return traceable_tokens
 
