@@ -9,7 +9,6 @@ import sys
 import unicodedata
 
 from dataclasses import (
-    asdict,
     dataclass,
 )
 from transformers import (
@@ -20,6 +19,7 @@ from transformers import (
 from logzero import logger
 
 DEBUG_MODE = False
+DEBUG_LINES = 5
 
 @dataclass
 class TokenWithOffset:
@@ -31,111 +31,6 @@ class TokenWithOffset:
     start_offset: int
     end_line: int
     end_offset: int
-
-def log_error_info(
-    char_index = None,
-    line = None,
-    line_chars = None,
-    line_index = None,
-    tokenizer: BertJapaneseTokenizer = None,
-    tokens = None,
-    token_index = None,
-    traceable_tokens = None,
-    word_index = None,
-    words = None,
-):
-    def get_index(l, index):
-        if l is None or index is None:
-            return None
-        return l[index]
-    word = get_index(words, word_index)
-    token = get_index(tokens, token_index)
-    logger.error('line_index: %s', line_index)
-    logger.error('char_index: %s', char_index)
-    logger.error('token_index: %s', token_index)
-    logger.error('word: %s', word)
-    if word is not None:
-        logger.error('word_index: %s', word_index)
-        for i, c in enumerate(word):
-            logger.error('word[%s]: %s', i, c)
-            logger.error('word[%s] name: %s', i, unicodedata.name(c))
-        logger.error('words digest: %s', words[word_index-5:word_index+6])
-    if token is not None:
-        logger.error('token: %s', token)
-        if tokenizer is not None:
-            logger.error('token is unk: %s', token not in tokenizer.subword_tokenizer.vocab)
-        for i, c in enumerate(token):
-            logger.error('token[%s]: %s', i, c)
-            logger.error('token[%s] name: %s', i, unicodedata.name(c))
-        kd_token = unicodedata.normalize('NFKD', token)
-        for i, c in enumerate(kd_token):
-            logger.error('kd token[%s]: %s', i, c)
-            logger.error('kd token[%s] name: %s', i, unicodedata.name(c))
-        logger.error('words digest: %s', words[word_index-5:word_index+5])
-    logger.error('tokens digest: %s', tokens[token_index-5:token_index+5])
-    if line is not None and char_index is not None:
-        logger.error('offset character: %s', line[char_index])
-        name = unicodedata.name(line[char_index])
-        logger.error('offset character name: %s', name)
-        #logger.error('line digest: %s', line[char_index-5:char_index+5])
-        for i in range(-2, 3):
-            logger.error('char %s: %s', i, line[char_index+i])
-            logger.error('char %s name: %s', i, unicodedata.name(line[char_index+i]))
-    if line_chars is not None and char_index is not None:
-        for i in range(char_index-2, char_index+3):
-            if i >= 0 and i < len(line_chars):
-                logger.error('line character %s: %s', i, line_chars[i])
-                name = unicodedata.name(line_chars[i].text)
-                logger.error('line character %s name: %s', i, name)
-    if traceable_tokens is not None:
-        for i in range(-5, 0):
-            if i >= 0 and i < len(line_chars):
-                logger.error('traceable token %s: %s', i, traceable_tokens[i])
-
-def merge_tokens(
-    tokens: list[TokenWithOffset],
-):
-    traceable_token = TokenWithOffset(
-        text=''.join([t.text for t in tokens]),
-        start_line=tokens[0].start_line,
-        start_offset=tokens[0].start_offset,
-        end_line=tokens[-1].end_line,
-        end_offset=tokens[-1].end_offset,
-    )
-    return traceable_token
-
-def decompose_line_to_characters_with_offset(line, line_index):
-    # ライン文字列を構成文字単位でトークナイズする
-    # (TRADE_MARK_SIGNのような合字をサブワード化された '##T' などとマッチさせるための対策)
-    offset_start = 0
-    offset_end = 0
-    kd_chars = []
-    for i, c in enumerate(unicodedata.normalize('NFKD', line)):
-        assert len(c) == 1
-        while True:
-            # NOTE: 正規化すると順序が変わる場合がある (結合文字などで順序の正規化が起こる)
-            # 例 (順序正規化, canonical ordering):
-            # normalize('NFD', COMBINING DIAERESIS' + 'COMBINING BREVE BELOW' + ...)
-            # -> 'COMBINING BREVE BELOW' + 'COMBINING DIAERESIS' + ...
-            # 対策: kd_chars に溜めておいて、有効な幅を記録する
-            # 全ての kd_chars が一度消費された段階で次の offset_start に進む
-            if c in kd_chars:
-                kd_chars.remove(c)
-                traceable_char = TokenWithOffset(
-                    text=c,
-                    start_line=line_index,
-                    start_offset=offset_start,
-                    end_line=line_index,
-                    end_offset=offset_end,
-                )
-                yield traceable_char
-                break
-            else:
-                kd_chars.extend(unicodedata.normalize('NFKD', line[offset_end]))
-                offset_end += 1
-        if len(kd_chars) == 0:
-            offset_start = offset_end
-    #logger.warning('kd_chars: %s', kd_chars)
 
 def tokenize_with_offsets(
     tokenizer: BertJapaneseTokenizer,
@@ -152,11 +47,12 @@ def tokenize_with_offsets(
         raise ValueError(f'unsupported subword tokenizer: {tokenizer.subword_tokenizer_type}')
     
     for line_index, line in enumerate(lines):
-        #if DEBUG_MODE and line_index > 5:
-        #    break
+        if DEBUG_MODE and line_index >= DEBUG_LINES:
+            break
         words = tokenizer.word_tokenizer.tokenize(line)
-        line_chars = list(decompose_line_to_characters_with_offset(line, line_index))
-        char_index = 0
+        start_offset = 0
+        end_offset = 0
+        kd_char_counter: dict[str,int] = {}
         for word_index, word in enumerate(words):
             tokens = tokenizer.subword_tokenizer.tokenize(word)
             if tokens == [tokenizer.unk_token]:
@@ -164,61 +60,75 @@ def tokenize_with_offsets(
                 # word 単体が未知語であったため、文字単位に分解する
                 tokens = list(word)
             for token_index, token in enumerate(tokens):
-                # NOTE: この分解方法の場合、 token が UNK になることはないはず
-                actual_token = token.strip()
+                assert token is not tokenizer.unk_token
+                actual_token = token
                 if token_index >= 1:
                     # サブワードの '##' は2番目以降のサブワードにしか付与されない
                     if token.startswith('##'):
                         actual_token = actual_token[2:]
+                # NOTE: 正規化すると順序が変わる場合がある (結合文字などで順序の正規化が起こる)
+                # 例1
+                #   [COMBINING DIAERESIS] + [COMBINING BREVE BELOW] + ...
+                #   -> [COMBINING BREVE BELOW] + [COMBINING DIAERESIS] + ...
+                # 例2
+                #   [ARABIC LETTER ALEF WITH HAMZA ABOVE] + [ARABIC FATHA] + ...
+                #   -> [ARABIC LETTER ALEF] + [ARABIC FATHA] + [ARABIC LETTER HAMZA ABOVE] + ...
+                #   この場合、トークナイザはNFKCした状態で
+                #   [ARABIC LETTER ALEF WITH HAMZA ABOVE] 単体で切ったりしてきて厄介
+                # 対策: バッファから読み取った構成要素のカウントを kd_char_counter に溜めておいて
+                # トークン承認時点で kd_char_counter が空になった段階で次の start_offset に進む
                 kd_token = unicodedata.normalize('NFKD', actual_token)
-                first_char = kd_token[0]
-                found_first_char = False
-                for test_index in range(char_index, len(line_chars)):
-                    # NOTE: 最初の1文字を探す
-                    # ここでスキップされるのは空白文字くらいのはず
-                    if first_char == line_chars[test_index].text:
-                        found_first_char = True
-                        char_index = test_index
+                found_char = True
+                kd_char = None
+                for kd_char in kd_token:
+                    # トークン内の1文字ずつカウンターを照合する
+                    #logger.debug('kd_char: %s', kd_char)
+                    found_char = False
+                    while end_offset <= len(line):
+                    #while True:
+                        count = kd_char_counter.get(kd_char, 0)
+                        #logger.debug('count: %s', count)
+                        if count > 0:
+                            # 存在するならカウントを減らす
+                            if count == 1:
+                                kd_char_counter.pop(kd_char)
+                            else:
+                                kd_char_counter[kd_char] = count - 1
+                            found_char = True
+                            break
+                        # 存在しないなら次の文字の構成文字をカウンターに追加する
+                        if end_offset < len(line):
+                            for c in unicodedata.normalize('NFKD', line[end_offset]):
+                                if c in [' ', '\t']:
+                                    # 空白文字はスキップする
+                                    continue
+                                kd_char_counter[c] = kd_char_counter.get(c, 0) + 1
+                        end_offset += 1
+                    if not found_char:
+                        # 行内の文字を読み切ってもトークン内の全構成文字を見つけられなかった
+                        not_found_char = kd_char
                         break
-                if not found_first_char:
-                    # NOTE: 1文字目が見つからない場合はエラー
-                    logger.error('first_char not found: %s', first_char)
-                    logger.error('first char name: %s', unicodedata.name(first_char))
-                    log_error_info(
-                        char_index=char_index,
-                        line=line,
-                        line_chars=line_chars,
-                        line_index=line_index,
-                        tokenizer=tokenizer,
-                        tokens=tokens,
-                        token_index=token_index,
-                        traceable_tokens=traceable_tokens,
-                        words=words,
-                        word_index=word_index,
-                    )
-                    raise ValueError(f'first char not found: {first_char}')
-                merged = merge_tokens(line_chars[char_index:char_index+len(kd_token)])
-                if kd_token != merged.text:
+                if not found_char:
                     logger.error('token not found: %s', token)
-                    logger.error('merged: %s', merged)
                     logger.error('kd token: %s', kd_token)
-                    logger.error('word tokens: %s', tokens)
-                    logger.error('word -1 tokens: %s', list(words[word_index-1]))
-                    log_error_info(
-                        #char_index=first_char_start_index,
-                        char_index=char_index,
-                        line=line,
-                        line_index=line_index,
-                        tokenizer=tokenizer,
-                        tokens=tokens,
-                        token_index=token_index,
-                        traceable_tokens=traceable_tokens,
-                        words=words,
-                        word_index=word_index,
-                    )
+                    logger.error('not found char: %s', not_found_char)
+                    logger.error('counter: %s', kd_char_counter)
+                    logger.error('start_offset: %s', start_offset)
+                    logger.error('end_offset: %s', end_offset)
+                    logger.error('line length: %s', len(line))
                     raise ValueError('token not found')
-                traceable_tokens.append(merged)
-                char_index += len(kd_token)
+                token_with_offset = TokenWithOffset(
+                    text=token,
+                    start_line=line_index,
+                    start_offset=start_offset,
+                    end_line=line_index,
+                    end_offset=end_offset,
+                )
+                #logger.debug('token_with_offset: %s', token_with_offset)
+                traceable_tokens.append(token_with_offset)
+                if len(kd_char_counter) == 0:
+                    # カウンタが空なら開始オフセットを進める
+                    start_offset = end_offset
     return traceable_tokens
 
 if __name__ == '__main__':
