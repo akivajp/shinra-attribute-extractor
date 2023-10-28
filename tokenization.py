@@ -117,6 +117,9 @@ def tokenize_with_offsets(
                     logger.error('end_offset: %s', end_offset)
                     logger.error('line length: %s', len(line))
                     raise ValueError('token not found')
+                while line[start_offset] in [' ', '\t']:
+                    # 空白文字はスキップする
+                    start_offset += 1
                 token_with_offset = TokenWithOffset(
                     text=token,
                     start_line=line_index,
@@ -126,7 +129,7 @@ def tokenize_with_offsets(
                 )
                 #logger.debug('token_with_offset: %s', token_with_offset)
                 traceable_tokens.append(token_with_offset)
-                if len(kd_char_counter) == 0:
+                if not kd_char_counter:
                     # カウンタが空なら開始オフセットを進める
                     start_offset = end_offset
     return traceable_tokens
