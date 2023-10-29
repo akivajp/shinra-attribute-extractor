@@ -32,6 +32,8 @@ class TokenWithOffset:
     end_line: int
     end_offset: int
 
+SPACE_CHARS = [' ', '\t', '　']
+
 def tokenize_with_offsets(
     tokenizer: BertJapaneseTokenizer,
     text,
@@ -99,7 +101,7 @@ def tokenize_with_offsets(
                         # 存在しないなら次の文字の構成文字をカウンターに追加する
                         if end_offset < len(line):
                             for c in unicodedata.normalize('NFKD', line[end_offset]):
-                                if c in [' ', '\t']:
+                                if c in SPACE_CHARS:
                                     # 空白文字はスキップする
                                     continue
                                 kd_char_counter[c] = kd_char_counter.get(c, 0) + 1
@@ -117,7 +119,7 @@ def tokenize_with_offsets(
                     logger.error('end_offset: %s', end_offset)
                     logger.error('line length: %s', len(line))
                     raise ValueError('token not found')
-                while line[start_offset] in [' ', '\t']:
+                while line[start_offset] in SPACE_CHARS:
                     # 空白文字はスキップする
                     start_offset += 1
                 token_with_offset = TokenWithOffset(
@@ -147,3 +149,6 @@ if __name__ == '__main__':
                 config_name = sys.argv[2]
             tokenized = tokenize_with_offsets(test_tokenizer, html)
             #logger.debug('tokenized: %s', tokenized)
+    #tokenized = tokenize_with_offsets(test_tokenizer, '<td> 　銀')
+    #for i, token in enumerate(tokenized):
+    #    logger.debug('token[%s]: %s', i, token)
