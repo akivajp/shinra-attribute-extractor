@@ -140,7 +140,6 @@ def tokenize(
     return _tokenize
 
 # トークン化と IOB2 タグの付与
-#def tokenize_and_tag(example):
 def tokenize_and_tag(
     tokenizer: PreTrainedTokenizer,
     map_attribute_name_to_id: Dict[str, int],
@@ -154,15 +153,27 @@ def tokenize_and_tag(
             logger.error('failed to tokenize, page_id: %s', example['page_id'])
             raise e
         tokens = [token.text for token in tokens_with_offsets]
-        tags, num_tagged, num_skipped = tag_tokens_with_annotation_list(
-            tokens_with_offsets,
-            [
-                {'attribute': attribute, 'html_offset': html_offset}
-                for attribute, html_offset in zip(
-                    example['attributes.attribute'], example['attributes.html_offset']
-                )
-            ]
-        )
+        try:
+            def get_records(example):
+                return [
+                    dict(
+                        attribute=attribute,
+                        html_offset=html_offset,
+                        # 以下はデバッグ情報
+                        page_id=example['page_id'],
+                        category_name=example['category_name'],
+                    )
+                    for attribute, html_offset in zip(
+                        example['attributes.attribute'], example['attributes.html_offset']
+                    )
+                ]
+            tags, num_tagged, num_skipped = tag_tokens_with_annotation_list(
+                tokens_with_offsets,
+                get_records(example),
+            )
+        except Exception as e:
+            logger.error('failed to tag, page_id: %s', example['page_id'])
+            raise e
         extended_tags = [None] * len(map_attribute_name_to_id)
         ene = example['ENE']
         attribute_name_counter = map_ene_to_attribute_name_counter[ene]
@@ -350,6 +361,8 @@ def preprocess_for_training(
                 'attributes.attribute',
                 'attributes.html_offset',
                 'ENE',
+                # 以下はデバッグ用情報
+                'category_name',
             ]
         ),
         batched=True,

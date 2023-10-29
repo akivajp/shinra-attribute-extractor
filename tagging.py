@@ -68,7 +68,24 @@ def tag_tokens_with_annotation_list(
                 #last_token = token
                 last_token_index = token_index
                 continue
-            assert token.start_line == start_line, f'{token.start_line} != {start_line}'
+            #assert token.start_line == start_line, f'{token.start_line} != {start_line}'
+            try:
+                assert token.start_line == start_line, f'{token.start_line} != {start_line}'
+            except AssertionError as e:
+                logger.error('record_index: %s', record_index)
+                logger.error('record: %s', record)
+                logger.error('token_index: %s', token_index)
+                logger.error('token: %s', token)
+                logger.error('start_line: %s', start_line)
+                logger.error('last_token_index: %s', last_token_index)
+                if last_token_index is not None:
+                    last_token = traceable_tokens[last_token_index]
+                    logger.error('last token: %s', last_token)
+                    line_tokens = [token for token in traceable_tokens if token.start_line == start_line]
+                    #logger.error('line_tokens: %s', line_tokens)
+                    for i, token in enumerate(line_tokens):
+                        logger.error('line_token[%s]: %s', i, token)
+                raise e
             if token.start_offset < start_offset:
                 last_token_index = token_index
                 continue

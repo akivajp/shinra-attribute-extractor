@@ -383,7 +383,8 @@ async def main():
             logzero.logfile(logfile)
     accelerator.wait_for_everyone()
 
-    raw_dataset = load_dataset('./shinra_attribute_extraction_2022')
+    #raw_dataset = load_dataset('./shinra_attribute_extraction_2022')
+    raw_dataset = load_dataset('./shinra_attribute_extraction_2023')
     logger.debug('raw_dataset: %s', raw_dataset)
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -880,7 +881,7 @@ async def main():
                     completed_steps += 1
 
                 if isinstance(checkpointing_steps, int):
-                    if completed_steps % checkpointing_steps == 0:
+                    if not completed_steps % checkpointing_steps:
                         zero_filled_step = str(completed_steps).zfill(len(str(args.max_train_steps - 1)))
                         #output_dir = f"step_{completed_steps}"
                         #output_dir = f"epoch_{zero_filled_epoch}_step_{completed_steps}"
